@@ -28,9 +28,9 @@ export function claudeWrapperScript() {
 
 /** Adapter options that pair with the wrapper. */
 export const CLAUDE_ADAPTER_POLICY = {
-  // Only project settings from the empty per-thread directory; the user's
-  // ~/.claude settings, hooks and enabled plugins never load.
-  settingSources: ['project'] as Array<'project'>,
+  // `--setting-sources ''`: no user, project or local settings at all, so
+  // ancestor .claude/settings.json hooks or plugins can never load.
+  settingSources: [] as Array<'project'>,
   // Non-interactive default mode denies anything not explicitly allowed.
   permissionMode: 'default' as const,
   allowedTools: [`mcp__${BRIDGE_SERVER}`],
@@ -39,21 +39,4 @@ export const CLAUDE_ADAPTER_POLICY = {
 
 // Codex: see codex-app-server.ts (thread with `environments: []`).
 
-/** Copilot CLI arguments. Bridge tools are exposed as `tanstack-<name>`. */
-export function copilotPolicyArgs(toolNames: string[]): string[] {
-  const exposed = toolNames.map((name) => `${BRIDGE_SERVER}-${name}`);
-  return [
-    '--no-auto-update',
-    '--no-custom-instructions',
-    '--no-ask-user',
-    '--no-remote',
-    '--disable-builtin-mcps',
-    '--disallow-temp-dir',
-    // The model sees only these tools; nothing else is callable.
-    `--available-tools=${exposed.join(',')}`,
-    ...(exposed.length ? [`--allow-tool=${BRIDGE_SERVER}`] : []),
-    '--deny-tool=shell',
-    '--deny-tool=write',
-    '--deny-tool=url',
-  ];
-}
+// Copilot: see copilot-adapter.ts (official SDK session configuration).

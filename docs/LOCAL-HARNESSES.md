@@ -1,62 +1,60 @@
 # Local harness routing
 
-OpenDots can route a Dot's chat turns through a subscription CLI on this
-machine: Claude Code, Codex, or GitHub Copilot CLI. Routing is local only
-(loopback host, no containers; development anywhere or the built app on macOS).
+OpenDots can route a Dot's chat turns through a subscription harness on this
+machine: Claude Code, Codex, or GitHub Copilot. Routing is local only (loopback
+host, never in a container; development anywhere or the built app on macOS).
+The same guard protects the account, login and model-management API.
 
 ## Routing
 
-- **Dot defaults** — each Dot has a default harness and model (Dot settings ›
-  Model route). "Project configuration" keeps the server's `MODEL_PROVIDER`.
-- **Conversations** copy the Dot's harness and model when created. The harness
-  never changes afterwards; the model can be changed in that conversation only.
-- **Accounts** — Settings › Local harnesses lists a System default and any
-  OpenDots-owned accounts. One account per harness is active globally. Every new
-  turn (chat, page chat, Slack, scheduled tasks, voice compute) uses the active
-  account; a running turn keeps the account it started with.
-- There is no automatic account, model or provider fallback. A missing model or
-  account stops the turn with guidance.
+- **Dot defaults** — each Dot has a default harness and model. "Project
+  configuration" keeps the server's `MODEL_PROVIDER`.
+- **Conversations** copy the Dot's harness and model when created and keep the
+  harness forever; only the conversation's model can change. Legacy Dots and
+  conversations that ran through a project-configured harness are seeded once
+  with that route.
+- **Accounts** — one active account per harness, globally: the System default
+  or an OpenDots account. Every entry point (chat, page chat, Slack, scheduled
+  tasks, voice compute) uses one resolver; a running turn keeps the account it
+  started with, and an in-use account cannot be re-authenticated, signed out
+  or removed. Only one turn runs per conversation at a time.
+- No automatic account, model or provider fallback. Copilot model changes and
+  Codex reroutes stop the turn and require a model choice.
 
-## Tool boundary
+## Isolation
 
-Each harness sees only OpenDots tools, which run in the OpenDots server with the
-existing Dot, Space and computer permission checks.
+Every turn runs in a fresh 0700 runtime home (`CLAUDE_CONFIG_DIR`,
+`CODEX_HOME` or `COPILOT_HOME`), deleted afterwards, and receives only the
+account credential. Credentials, every provider profile override, Orca/agent
+session variables, OpenTelemetry export and shell startup hooks are scrubbed;
+telemetry and update checks are disabled.
 
-| Harness     | Mechanism                                                                                                                                                                                                                                                                                                                                          |
-| ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Claude Code | `--tools ""`, `--strict-mcp-config` (only the per-turn loopback bridge), `--disable-slash-commands`, `--setting-sources project` in an empty per-thread directory, `--permission-mode default` with only `mcp__tanstack` allowed.                                                                                                                  |
-| Codex       | `codex app-server` thread with `environments: []` (no shell, patch, file or image tools), `features.stable_environment_tools=false`, apps/plugins/collaboration/web search disabled, `mcp_servers={}`; OpenDots tools are dynamic tools executed by OpenDots. Native tool items or approval requests stop/deny the turn. Requires Codex ≥ 0.160.0. |
-| Copilot CLI | `--available-tools` limited to `tanstack-*` bridge tools, `--disable-builtin-mcps`, `--no-custom-instructions`, `--no-ask-user`; managed homes set `disableAllHooks`.                                                                                                                                                                              |
-
-The **System default** is supported for Claude Code only. Codex and Copilot load
-user hooks, plugins, MCP servers and profiles from their default home, which
-OpenDots cannot disable per run, so they require an OpenDots-managed account.
-
-## Accounts and secrets
-
-Managed profiles live outside the repository (macOS:
-`~/Library/Application Support/OpenDots/harness-profiles`, mode 0700) and are
-selected per child process with `CLAUDE_CONFIG_DIR`, `CODEX_HOME` or
-`COPILOT_HOME`. Inherited credentials and profile overrides are scrubbed. Native
-login flows store credentials (Claude Code and Copilot use the macOS Keychain;
-Codex uses its profile). APIs return only non-secret status and identity.
-Account details and receipts are never sent to models or CopilotKit metadata.
+| Harness        | Tools                                                                                                                                                                                                                                                                                                                                                          | Credential                                                                                                                                                                                                                                                                                                                                                                                          |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Claude Code    | `--tools ""`, `--strict-mcp-config` (per-turn loopback bridge only), `--disable-slash-commands`, `--setting-sources ''`, `CLAUDE_CODE_DISABLE_CLAUDE_MDS`/`AUTO_MEMORY`/`GIT_INSTRUCTIONS`, `--permission-mode default` allowing only `mcp__tanstack`.                                                                                                         | `CLAUDE_CODE_OAUTH_TOKEN`. Managed: minted by `claude setup-token` in a throwaway profile, stored in Keychain under an OpenDots-only service. System default: the ordinary `Claude Code-credentials` Keychain item, read-only.                                                                                                                                                                      |
+| Codex          | `codex app-server` thread with `environments: []` (confirmed by the server, or the turn is refused), `stable_environment_tools=false`, apps/plugins/hooks/MCP/collaboration/web search off; OpenDots tools are dynamic tools executed by OpenDots; native items, approvals, other threads/turns and repeated call IDs stop the turn. Requires Codex ≥ 0.160.0. | Copy of the account's `auth.json`. Managed: `codex login` (file storage) in a throwaway home, promoted into the private profile only if the login is still current; refreshed tokens are kept by compare-and-swap. System default: ordinary `~/.codex/auth.json`, read-only, with the refresh token removed so it can never be rotated.                                                             |
+| GitHub Copilot | Official `@github/copilot-sdk` session: only OpenDots custom tools in `availableTools`, everything else denied; config discovery, custom instructions, skills, file hooks, MCP servers, telemetry and git operations off.                                                                                                                                      | Managed: token from `gh auth login` in an isolated `GH_CONFIG_DIR` (requires GitHub CLI), stored in Keychain, used with `useLoggedInUser: false`. System default: Copilot's own login resolution (`useLoggedInUser: true`) with an empty GitHub CLI profile, so a gh identity is never substituted; if Copilot's own login cannot be resolved from the isolated runtime, sign-in guidance is shown. |
 
 ## Recovery
 
-Quota, auth, model and missing-CLI failures show an application-authored message
-and a local receipt. The owner chooses an account and explicitly continues: the
-thread re-runs without a duplicate user message, completed tool results are
-restated instead of replayed, and interrupted tool calls are reported as having
-an unknown outcome. Background failures wait for the owner.
+Provider errors are classified inside the adapter (quota, auth, model, missing
+CLI, unknown) before any engine or app logging; only application-authored text
+is shown. Side-effecting OpenDots tools are journaled durably per user message:
+intent is recorded before execution and the full result afterwards. An explicit
+continuation (bound to the unanswered message; a new message discards it)
+returns stored results for identical completed actions, refuses actions whose
+outcome is unknown, and rechecks current permissions first. Turns interrupted
+by a server restart are marked failed with unknown tool outcomes.
 
 ## Known limitations
 
-- Live CLI behaviour was verified only against local help, generated protocol
-  schemas and fixtures; no live inference or login was run during development.
-- Copilot CLI's JSONL event names and MCP tool naming (`<server>-<tool>`) are not
-  formally documented; the adapter fails closed if they differ.
-- Copilot has no machine-readable auth status; status is known after login or a
-  turn. Copilot sign-out cannot remove Keychain credentials.
-- Model discovery uses `codex debug models` for Codex; Claude and Copilot use a
-  catalog plus custom IDs.
+- No live inference or login ran during development. Native flag and SDK
+  behavior was verified from installed help text, binary strings, generated
+  Codex protocol schemas and SDK type definitions, with fake CLI and SDK
+  fixtures.
+- `claude setup-token` and `gh auth login` run without a terminal UI; a code the
+  browser shows can be pasted in Settings. The Claude Keychain JSON shape and the
+  Codex `last_refresh` field are based on observed formats, not documentation.
+- Copilot's own stored login location is native and undocumented; OpenDots never
+  reads it directly. Copilot model discovery uses the SDK; Claude uses a catalog
+  plus custom IDs.

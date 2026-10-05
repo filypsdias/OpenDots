@@ -12,6 +12,7 @@ export { slackIdentity } from './slack-channel.js';
 import { Store } from './store.js';
 import { WorkspaceStore } from './workspace.js';
 import { DotAgent } from './dot-agent.js';
+import { resolveActiveModel } from './model-adapters.js';
 import { runThreadTurn } from './headless.js';
 import { setupStatus, type PlatformConfig } from './platform-config.js';
 import { validateRuntimeScope } from './runtime-scope.js';
@@ -32,6 +33,21 @@ export class Platform {
       config,
       () => store.settings().paused,
     );
+    // Seed legacy local-harness routes once from a valid project config.
+    // An invalid harness project config is retried on a later start.
+    try {
+      const resolved = resolveActiveModel(config);
+      workspace.projectRoute = resolved.harness
+        ? { harness: resolved.provider, model: resolved.model }
+        : null;
+      workspace.seedLegacyRoutes(
+        resolved.harness ? resolved.provider : null,
+        resolved.harness ? resolved.model : null,
+      );
+    } catch {
+      if (!['claude-code', 'codex'].includes(config.modelProvider ?? ''))
+        workspace.seedLegacyRoutes(null, null);
+    }
     this.pages = new PageService(workspace, () => {
       this.requireReady();
       return this.intelligence!;
@@ -90,7 +106,7 @@ export class Platform {
       this.handler?.channels?.status().overall ??
         (this.config.slackChannel ? 'setup_required' : 'not_configured'),
       this.channelStartupFailed,
-      this.workspace.dots().some((dot) => !!dot.harness),
+      this.workspace.usesHarnessRouting(),
     );
   }
   requireReady() {

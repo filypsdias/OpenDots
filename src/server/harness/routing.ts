@@ -5,7 +5,6 @@ import { resolveActiveModel } from '../model-adapters.js';
 import { HARNESS_LABELS, type HarnessProvider } from '../../shared/harness.js';
 import type { AccountSnapshot } from './store.js';
 import { HarnessTurnError } from './errors.js';
-import { systemDefaultSupported } from './accounts.js';
 
 export type TurnRoute =
   | { kind: 'http'; harness: null; model: string; resolved: HttpModel }
@@ -28,15 +27,18 @@ export function resolveTurnRoute(
   threadId: string,
 ): TurnRoute {
   const conversation = workspace.requireThread(threadId);
-  let harness = conversation.harness ?? null;
-  let model = conversation.model ?? null;
+  const harness = conversation.harness ?? null;
+  const model = conversation.model ?? null;
   if (!harness) {
-    // Legacy and HTTP conversations keep the project-configured provider.
+    // A conversation without a stored harness is an HTTP conversation. It is
+    // never silently turned into a hidden local-harness route later.
     const resolved = resolveActiveModel(config);
-    if (!resolved.harness)
-      return { kind: 'http', harness: null, model: resolved.model, resolved };
-    harness = resolved.provider;
-    model = resolved.model;
+    if (resolved.harness)
+      throw new HarnessTurnError(
+        'model',
+        'This conversation uses the project HTTP model, but the project is now configured for a local harness. Start a new conversation to use it, or restore the HTTP model configuration.',
+      );
+    return { kind: 'http', harness: null, model: resolved.model, resolved };
   }
   if (conversation.modelRequired || !model)
     throw new HarnessTurnError(
@@ -49,11 +51,6 @@ export function resolveTurnRoute(
     throw new HarnessTurnError(
       'auth',
       `No ${HARNESS_LABELS[harness]} account is selected. Choose one in Settings › Local harnesses.`,
-    );
-  if (!systemDefaultSupported(account))
-    throw new HarnessTurnError(
-      'auth',
-      `${HARNESS_LABELS[harness]} runs only with an OpenDots-managed account, because its system profile can load hooks, plugins and MCP servers OpenDots cannot disable. Add an account in Settings › Local harnesses.`,
     );
   return { kind: 'harness', harness, model, account };
 }

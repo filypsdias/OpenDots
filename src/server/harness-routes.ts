@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
 import type { Platform } from './platform.js';
+import { assertHarnessRuntime, harnessEnvironment } from './harness-runtime.js';
 import {
   HARNESS_PROVIDERS,
   type ConversationRoute,
@@ -20,6 +21,36 @@ export function harnessRoutes(platform: Platform) {
   const { workspace } = platform;
   const ledger = workspace.harness;
 
+  // Account, login and model management drive local CLIs and credentials:
+  // only on this machine's loopback host, outside containers, like turns.
+  app.use('/harness/*', async (c, next) => {
+    try {
+      assertHarnessRuntime({ provider: 'codex', ...harnessEnvironment() });
+    } catch {
+      return c.json(
+        {
+          error:
+            'Local harness management is available only for OpenDots running on this machine (loopback host, not in a container).',
+        },
+        403,
+      );
+    }
+    await next();
+  });
+  app.use('/harness', async (c, next) => {
+    try {
+      assertHarnessRuntime({ provider: 'codex', ...harnessEnvironment() });
+    } catch {
+      return c.json(
+        {
+          error:
+            'Local harness management is available only for OpenDots running on this machine (loopback host, not in a container).',
+        },
+        403,
+      );
+    }
+    await next();
+  });
   app.get('/harness', async (c) =>
     c.json({
       providers: await workspace.accounts.providers(),
@@ -51,6 +82,19 @@ export function harnessRoutes(platform: Platform) {
       account,
       prompt: workspace.accounts.loginPrompt(account.id),
     });
+  });
+  app.post('/harness/accounts/:id/login/code', async (c) => {
+    const data = z
+      .object({ code: z.string().trim().min(4).max(512) })
+      .strict()
+      .safeParse(await c.req.json().catch(() => null));
+    if (!data.success) return c.json({ error: 'Enter the sign-in code.' }, 400);
+    workspace.accounts.submitLoginCode(c.req.param('id'), data.data.code);
+    return c.json({ ok: true });
+  });
+  app.post('/harness/accounts/:id/login/cancel', (c) => {
+    workspace.accounts.cancelLogin(c.req.param('id'));
+    return c.json(ledger.account(c.req.param('id')) ?? { ok: true });
   });
   app.post('/harness/accounts/:id/logout', async (c) =>
     c.json(await workspace.accounts.logout(c.req.param('id'))),
@@ -105,7 +149,7 @@ export function harnessRoutes(platform: Platform) {
               unknownTools: last.tools
                 .filter((tool) => tool.status !== 'completed')
                 .map((tool) => tool.name),
-              armed: armed === last.id,
+              armed: armed?.receiptId === last.id,
             }
           : null,
     };
@@ -126,11 +170,10 @@ export function harnessRoutes(platform: Platform) {
    * duplicated; completed tool results are restated rather than replayed.
    */
   app.post('/conversations/:id/continue', async (c) => {
+    // Receipt only: the turn uses the provider's global selection at launch,
+    // so a stale client can never reverse an account switch made elsewhere.
     const data = z
-      .object({
-        receiptId: z.string().min(1).max(100),
-        accountId: z.string().min(1).max(100).optional(),
-      })
+      .object({ receiptId: z.string().min(1).max(100) })
       .strict()
       .safeParse(await c.req.json().catch(() => null));
     if (!data.success)
@@ -142,19 +185,19 @@ export function harnessRoutes(platform: Platform) {
         { error: 'Conversation has no failed turn to continue.' },
         409,
       );
-    if (current.receipts.some((receipt) => receipt.outcome === 'running'))
+    if (
+      ledger.isLive(threadId) ||
+      current.receipts.some((receipt) => receipt.outcome === 'running')
+    )
       return c.json({ error: 'Conversation is already running.' }, 409);
-    if (data.data.accountId) {
-      if (!current.harness)
-        return c.json(
-          { error: 'Conversation does not use a local harness.' },
-          400,
-        );
-      ledger.activate(current.harness, data.data.accountId);
-    }
     if (current.modelRequired)
       return c.json(
         { error: 'Choose a model for this conversation first.' },
+        409,
+      );
+    if (!ledger.receipt(data.data.receiptId)?.promptId)
+      return c.json(
+        { error: 'This failed turn has no unanswered message to continue.' },
         409,
       );
     ledger.armContinuation(threadId, data.data.receiptId);

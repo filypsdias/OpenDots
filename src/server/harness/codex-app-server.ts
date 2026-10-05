@@ -4,7 +4,9 @@ import { z } from 'zod';
 import { EventType, normalizeSystemPrompts } from '@tanstack/ai';
 import type { AdapterYieldChunk, TextOptions, Tool } from '@tanstack/ai';
 import { BaseTextAdapter } from '@tanstack/ai/adapters';
-import { conversationPrompt } from './copilot-adapter.js';
+import { conversationPrompt } from './prompt.js';
+import { sanitizeChunk } from './errors.js';
+import { combinedSignal } from './copilot-adapter.js';
 
 // Codex runs through its app-server protocol, not `codex exec`: a thread with
 // `environments: []` has no environment, so the shell, apply_patch, file and
@@ -148,6 +150,8 @@ export interface CodexAppServerConfig {
   env: NodeJS.ProcessEnv;
   executable?: string;
   spawnProcess?: typeof spawn;
+  /** Outer turn cancellation (owner stop, pause, permission change). */
+  signal?: AbortSignal;
 }
 
 export class CodexAppServerAdapter extends BaseTextAdapter<
@@ -167,12 +171,42 @@ export class CodexAppServerAdapter extends BaseTextAdapter<
     super({}, model);
   }
 
+  /** Provider errors leave the adapter only as a sanitized kind. */
   async *chatStream(options: TextOptions): AsyncIterable<AdapterYieldChunk> {
+    for await (const chunk of this.rawStream(options))
+      yield sanitizeChunk(chunk);
+  }
+
+  private async *rawStream(
+    options: TextOptions,
+  ): AsyncIterable<AdapterYieldChunk> {
     const model = this.model;
     const runId = options.runId ?? this.generateId();
     const threadId = options.threadId ?? this.generateId();
     const now = () => Date.now();
-    const signal = options.abortController?.signal;
+    const signal = combinedSignal(
+      options.abortController?.signal ??
+        (options as { request?: { signal?: AbortSignal } }).request?.signal,
+      this.settings.signal,
+    );
+    // Never spawn Codex for a turn that is already cancelled.
+    if (signal?.aborted) {
+      yield {
+        type: EventType.RUN_STARTED,
+        runId,
+        threadId,
+        model,
+        timestamp: now(),
+      } as AdapterYieldChunk;
+      yield {
+        type: EventType.RUN_ERROR,
+        model,
+        timestamp: now(),
+        message: 'aborted',
+        error: { message: 'aborted' },
+      } as AdapterYieldChunk;
+      return;
+    }
     const queue: AdapterYieldChunk[] = [];
     let wake: (() => void) | undefined;
     const push = (chunk: AdapterYieldChunk) => {
@@ -262,12 +296,37 @@ export class CodexAppServerAdapter extends BaseTextAdapter<
         } as AdapterYieldChunk);
       }
     };
+    const seenCalls = new Set<string>();
+    let completed = false;
+    const protocolFailure = (reason: string) => {
+      interrupt();
+      finish(`Codex protocol violation: ${reason}`);
+    };
     const callTool = async (
       id: number | string,
       params: Record<string, unknown>,
     ) => {
-      const callId = String(params.callId ?? id);
+      const callId = String(params.callId ?? '');
       const name = String(params.tool ?? '');
+      const refuse = (reason: string) => {
+        send({
+          id,
+          error: { code: -32602, message: 'Not permitted by OpenDots.' },
+        });
+        protocolFailure(reason);
+      };
+      // Only calls for this exact thread and turn, never after cancellation,
+      // and never a repeated call ID (which could replay an action).
+      if (signal?.aborted || finished) return refuse('aborted');
+      if (
+        !callId ||
+        params.threadId !== codexThread ||
+        params.turnId !== turnId
+      )
+        return refuse('Codex tool call does not belong to this turn.');
+      if (seenCalls.has(callId))
+        return refuse('Codex repeated a tool call ID.');
+      seenCalls.add(callId);
       const input = params.arguments ?? {};
       const args = JSON.stringify(input);
       openTools.add(callId);
@@ -368,8 +427,19 @@ export class CodexAppServerAdapter extends BaseTextAdapter<
           });
         return;
       }
-      if (params.threadId && codexThread && params.threadId !== codexThread)
-        return;
+      // Every turn-scoped notification must name this thread and turn.
+      if (
+        codexThread &&
+        typeof params.threadId === 'string' &&
+        params.threadId !== codexThread
+      )
+        return protocolFailure('notification for another thread.');
+      if (
+        turnId &&
+        typeof params.turnId === 'string' &&
+        params.turnId !== turnId
+      )
+        return protocolFailure('notification for another turn.');
       switch (message.method) {
         case 'item/agentMessage/delta':
           emitText(String(params.itemId), String(params.delta ?? ''));
@@ -401,9 +471,13 @@ export class CodexAppServerAdapter extends BaseTextAdapter<
           break;
         case 'turn/completed': {
           const turn = (params.turn ?? {}) as {
+            id?: string;
             status?: string;
             error?: unknown;
           };
+          if (turnId && turn.id && turn.id !== turnId)
+            return protocolFailure('completion for another turn.');
+          completed = true;
           finish(
             turn.status === 'completed'
               ? undefined
@@ -433,10 +507,13 @@ export class CodexAppServerAdapter extends BaseTextAdapter<
       for (const entry of pending.values())
         entry.reject(new Error('Codex app-server exited.'));
       pending.clear();
+      // Exiting before turn/completed is never a successful turn.
       finish(
-        code === 0
+        completed
           ? undefined
-          : `Codex app-server exited ${code === 127 ? 'with code 127' : 'unexpectedly'}. ${stderr}`,
+          : code === 127
+            ? 'Codex app-server exited with code 127.'
+            : `Codex app-server exited before the turn completed. ${stderr}`,
       );
     });
     const abort = () => {
@@ -452,6 +529,11 @@ export class CodexAppServerAdapter extends BaseTextAdapter<
       model,
       timestamp: now(),
     } as AdapterYieldChunk);
+    const cancelled = () => finished || !!signal?.aborted;
+    const checkpoint = () => {
+      // Cancellation during initialization must never reach turn/start.
+      if (cancelled()) throw new Error('aborted');
+    };
     void (async () => {
       try {
         const init = (await request('initialize', {
@@ -463,6 +545,7 @@ export class CodexAppServerAdapter extends BaseTextAdapter<
           throw new Error(
             `Codex CLI must be updated: ${MIN_CODEX_VERSION.join('.')} or newer is required.`,
           );
+        checkpoint();
         send({ method: 'initialized' });
         const developerInstructions = normalizeSystemPrompts(
           options.systemPrompts,
@@ -470,6 +553,7 @@ export class CodexAppServerAdapter extends BaseTextAdapter<
           .map((prompt) => prompt.content)
           .filter((content) => content.trim())
           .join('\n\n');
+        checkpoint();
         const started = (await request('thread/start', {
           model,
           cwd: this.settings.cwd,
@@ -481,9 +565,26 @@ export class CodexAppServerAdapter extends BaseTextAdapter<
           allowProviderModelFallback: false,
           developerInstructions: developerInstructions || null,
           config: CODEX_LOCKDOWN_CONFIG,
-        })) as { thread?: { id?: string } };
+        })) as {
+          thread?: { id?: string; environments?: unknown };
+          model?: unknown;
+        };
+        // The server must confirm that no environment is selected; unknown or
+        // non-empty selection could expose native shell and file tools.
+        if (
+          !Array.isArray(started.thread?.environments) ||
+          started.thread.environments.length !== 0
+        )
+          throw new Error(
+            'Codex did not confirm an environment-free thread; refusing to run.',
+          );
+        if (typeof started.model === 'string' && started.model !== model)
+          throw new Error(
+            'model unavailable: Codex selected a different model.',
+          );
         codexThread = started.thread?.id;
         if (!codexThread) throw new Error('Codex did not start a thread.');
+        checkpoint();
         const turn = (await request('turn/start', {
           threadId: codexThread,
           environments: [],
@@ -496,6 +597,7 @@ export class CodexAppServerAdapter extends BaseTextAdapter<
           ],
         })) as { turn?: { id?: string } };
         turnId = turn.turn?.id;
+        if (!turnId) throw new Error('Codex did not start a turn.');
       } catch (error) {
         finish(
           error instanceof Error ? error.message : 'Codex request failed.',
@@ -546,6 +648,10 @@ export class CodexAppServerAdapter extends BaseTextAdapter<
         } as AdapterYieldChunk;
     } finally {
       signal?.removeEventListener('abort', abort);
+      if (!finished) finish('aborted');
+      for (const entry of pending.values())
+        entry.reject(new Error('Codex turn ended.'));
+      pending.clear();
       lines.close();
       child.stdin.end();
       if (child.exitCode === null) child.kill('SIGTERM');

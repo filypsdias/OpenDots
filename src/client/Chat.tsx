@@ -43,6 +43,7 @@ export function Chat({
   onSchedule,
   onComputer,
   onManageHarnesses,
+  routeVersion = 0,
 }: {
   thread: Conversation;
   dot: Dot;
@@ -55,6 +56,7 @@ export function Chat({
   onSchedule: () => void;
   onComputer?: () => void;
   onManageHarnesses?: () => void;
+  routeVersion?: number;
 }) {
   const { agent, isReady } = useAgent({
     agentId: `chat-${thread.id}`,
@@ -326,6 +328,7 @@ export function Chat({
         busy={running}
         onContinue={continueTurn}
         onManage={() => onManageHarnesses?.()}
+        refreshKey={routeVersion}
       />
       {pageContext && (
         <div className="page-chat-context">

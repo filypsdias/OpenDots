@@ -34,7 +34,11 @@ const PATTERNS: Array<[TurnErrorKind, RegExp]> = [
   ],
 ];
 
+const MARKER = /^harness-error:(quota|auth|model|missing_cli|unknown)$/;
+
 export function classifyHarnessFailure(text: string): TurnErrorKind {
+  const marked = text.match(MARKER)?.[1] as TurnErrorKind | undefined;
+  if (marked) return marked;
   for (const [kind, pattern] of PATTERNS) if (pattern.test(text)) return kind;
   return 'unknown';
 }
@@ -56,4 +60,87 @@ export function safeTurnMessage(
     default:
       return `The subscription CLI could not complete this turn (${name}). Check its local login and permissions, then retry.`;
   }
+}
+
+/** Provider-neutral error kind for an arbitrary thrown value. */
+export function kindOf(value: unknown): TurnErrorKind {
+  if (value instanceof HarnessTurnError) return value.kind;
+  const text =
+    value instanceof Error
+      ? value.message
+      : typeof value === 'string'
+        ? value
+        : value && typeof value === 'object' && 'message' in value
+          ? String((value as { message: unknown }).message)
+          : '';
+  return classifyHarnessFailure(text);
+}
+
+/**
+ * TanStack logs adapter errors (with the raw provider payload) through its
+ * logger. This logger keeps only the category and the classified kind, so CLI
+ * output with tokens, emails or paths never reaches server logs.
+ */
+export function sanitizedDebug(provider: HarnessProvider | null) {
+  const name = provider ?? 'http';
+  const line = (
+    level: 'warn' | 'error',
+    message: string,
+    meta?: Record<string, unknown>,
+  ) => {
+    const kind = kindOf(meta?.error ?? message);
+    console[level](`[opendots] ${name} turn ${level}: ${kind}`);
+  };
+  return {
+    errors: true,
+    provider: false,
+    output: false,
+    middleware: false,
+    tools: false,
+    agentLoop: false,
+    config: false,
+    request: false,
+    sandbox: false,
+    logger: {
+      debug: () => undefined,
+      info: () => undefined,
+      warn: (message: string, meta?: Record<string, unknown>) =>
+        line('warn', message, meta),
+      error: (message: string, meta?: Record<string, unknown>) =>
+        line('error', message, meta),
+    },
+  };
+}
+
+/**
+ * Replaces a raw provider error chunk with a machine-readable kind before it
+ * leaves the adapter (and before any engine or app logging). Raw CLI output
+ * can contain tokens, account emails and private paths.
+ */
+export function sanitizeChunk<T>(chunk: T): T {
+  const value = chunk as { type?: unknown; message?: unknown; error?: unknown };
+  if (value?.type !== 'RUN_ERROR') return chunk;
+  const kind = kindOf(
+    typeof value.message === 'string' ? value.message : value.error,
+  );
+  const message = `harness-error:${kind}`;
+  return {
+    type: 'RUN_ERROR',
+    model: (chunk as { model?: unknown }).model,
+    timestamp: Date.now(),
+    message,
+    code: kind,
+    error: { message, code: kind },
+  } as T;
+}
+
+/** Wraps a third-party harness adapter so its error chunks are sanitized. */
+export function sanitizedAdapter<
+  T extends { chatStream: (options: never) => AsyncIterable<unknown> },
+>(adapter: T): T {
+  const original = adapter.chatStream.bind(adapter);
+  adapter.chatStream = async function* (options: never) {
+    for await (const chunk of original(options)) yield sanitizeChunk(chunk);
+  } as T['chatStream'];
+  return adapter;
 }

@@ -1,4 +1,4 @@
-import { useEffect, useId, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import { api } from './api';
 import {
   HARNESS_LABELS,
@@ -18,8 +18,11 @@ export function ModelPicker({
   onChange,
   label = 'Model',
   required = false,
+  accountKey = null,
 }: {
   provider: HarnessProvider;
+  /** Active account; the list is refetched when it changes. */
+  accountKey?: string | null;
   value: string;
   onChange: (model: string) => void;
   label?: string;
@@ -39,7 +42,7 @@ export function ModelPicker({
     return () => {
       active = false;
     };
-  }, [provider]);
+  }, [provider, accountKey]);
   return (
     <>
       <label className="field-label" htmlFor={id}>
@@ -71,6 +74,52 @@ export function ModelPicker({
   );
 }
 
+/**
+ * Request generations for one mounted view. `isCurrent` is true only for the
+ * newest request, for the thread still shown, while mounted (StrictMode
+ * re-runs mount effects, so mounting resets the flag).
+ */
+export function createLatest() {
+  let generation = 0;
+  let mounted = true;
+  return {
+    mount() {
+      mounted = true;
+    },
+    unmount() {
+      mounted = false;
+    },
+    begin(threadId: string) {
+      generation += 1;
+      return { generation, threadId };
+    },
+    isCurrent(token: { generation: number; threadId: string }, shown: string) {
+      return (
+        mounted && token.generation === generation && token.threadId === shown
+      );
+    },
+  };
+}
+
+/**
+ * Arms the explicit continuation. Only the failed receipt is sent: the server
+ * uses the provider's current global account, so a switch made in Settings or
+ * another tab is never undone by a stale selection cached in this view.
+ */
+export async function continueConversation(
+  threadId: string,
+  receiptId: string,
+  call: typeof api = api,
+) {
+  return call<ConversationRoute>(
+    `/conversations/${threadId}/continue`,
+    'POST',
+    {
+      receiptId,
+    },
+  );
+}
+
 const RECOVERY: Record<TurnErrorKind, string> = {
   quota: 'The account hit a usage or quota limit.',
   auth: 'The account needs sign-in, or none is selected.',
@@ -89,38 +138,82 @@ export function RouteBar({
   busy,
   onContinue,
   onManage,
+  refreshKey = 0,
 }: {
   threadId: string;
   busy: boolean;
   onContinue: () => Promise<void>;
   onManage: () => void;
+  /** Changes when account settings may have changed elsewhere. */
+  refreshKey?: number;
 }) {
   const [route, setRoute] = useState<ConversationRoute>();
   const [accounts, setAccounts] = useState<HarnessAccount[]>([]);
   const [model, setModel] = useState('');
   const [error, setError] = useState('');
   const [working, setWorking] = useState(false);
+  // Only the newest request for the current thread may update state, so a
+  // slow older load can never overwrite a newer account or model.
+  const latest = useRef(createLatest());
+  const shown = useRef(threadId);
+  useEffect(() => {
+    latest.current.mount();
+    return () => latest.current.unmount();
+  }, []);
+  useEffect(() => {
+    // Never show one thread's controls with another thread's route.
+    shown.current = threadId;
+    setRoute(undefined);
+    setModel('');
+    setAccounts([]);
+    setError('');
+  }, [threadId]);
   const load = async () => {
+    const token = latest.current.begin(threadId);
     try {
       const next = await api<ConversationRoute>(
         `/conversations/${threadId}/route`,
       );
+      if (!latest.current.isCurrent(token, shown.current)) return;
       setRoute(next);
       setModel(next.model ?? '');
+      setError('');
       if (next.harness) {
         const all = await api<{ accounts: HarnessAccount[] }>('/harness');
+        if (!latest.current.isCurrent(token, shown.current)) return;
         setAccounts(
           all.accounts.filter((item) => item.provider === next.harness),
         );
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Route unavailable.');
+      if (latest.current.isCurrent(token, shown.current))
+        setError(e instanceof Error ? e.message : 'Route unavailable.');
     }
   };
   useEffect(() => {
     if (!busy) void load();
-  }, [threadId, busy]);
-  if (!route) return null;
+  }, [threadId, busy, refreshKey]);
+  useEffect(() => {
+    // The global account can change in another tab or window.
+    const refresh = () => void load();
+    window.addEventListener('focus', refresh);
+    return () => window.removeEventListener('focus', refresh);
+  }, [threadId]);
+  if (!route || route.threadId !== threadId)
+    return error ? (
+      <section className="route-bar" aria-label="Model route">
+        <p className="chat-error" role="alert">
+          {error}{' '}
+          <button
+            type="button"
+            className="link-button"
+            onClick={() => void load()}
+          >
+            Retry
+          </button>
+        </p>
+      </section>
+    ) : null;
   const harness = route.harness;
   const current = route.activeAccount;
   const earlier = [
@@ -134,6 +227,8 @@ export function RouteBar({
     ),
   ];
   const act = async (fn: () => Promise<unknown>) => {
+    // Mutations apply only to the conversation whose route is displayed.
+    if (route.threadId !== shown.current) return;
     setWorking(true);
     setError('');
     try {
@@ -167,6 +262,7 @@ export function RouteBar({
               value={model}
               required
               label="Model for this conversation"
+              accountKey={route.activeAccount?.id ?? null}
               onChange={setModel}
             />
             <button
@@ -249,15 +345,12 @@ export function RouteBar({
             disabled={working || route.modelRequired || (!!harness && !current)}
             onClick={() =>
               void act(async () => {
-                await api(`/conversations/${threadId}/continue`, 'POST', {
-                  receiptId: recovery.receiptId,
-                  ...(current ? { accountId: current.id } : {}),
-                });
+                await continueConversation(threadId, recovery.receiptId);
                 await onContinue();
               })
             }
           >
-            Continue{current ? ` with ${current.label}` : ''}
+            Continue with the active account
           </button>
         </div>
       )}

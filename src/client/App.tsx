@@ -98,6 +98,8 @@ export function App() {
   const [auth, setAuth] = useState('');
   const [needsAuth, setNeedsAuth] = useState(false);
   const [dialog, setDialog] = useState<Dialog>();
+  // Bumped when a dialog closes, so routes re-read global account selection.
+  const [routeVersion, setRouteVersion] = useState(0);
   const [mobile, setMobile] = useState(false);
   const [navCollapsed, setNavCollapsed] = useState(false);
   const [pane, setPane] = useState(false);
@@ -606,6 +608,7 @@ export function App() {
                     setDialog({ type: 'schedule', threadId: thread.id })
                   }
                   onManageHarnesses={() => setDialog({ type: 'harnesses' })}
+                  routeVersion={routeVersion}
                 />
               ) : (
                 <div className="new-conversation">
@@ -905,7 +908,10 @@ export function App() {
           dialog={dialog}
           state={state}
           workspace={workspace}
-          onClose={() => setDialog(undefined)}
+          onClose={() => {
+            setDialog(undefined);
+            setRouteVersion((value) => value + 1);
+          }}
           mutate={mutate}
           onOpen={setDialog}
         />

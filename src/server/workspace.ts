@@ -92,6 +92,16 @@ export class WorkspaceStore {
     this.accountManager ??= new AccountManager(this.harness, profileRoot());
     return this.accountManager;
   }
+  /**
+   * Route for Dots set to "Project configuration" when the project model is
+   * a local harness. New conversations persist it explicitly at creation, so
+   * a conversation's route is always stored, never inferred later.
+   */
+  projectRoute: { harness: HarnessProvider; model: string } | null = null;
+  /** Replaces the account manager (tests inject fakes for native CLIs). */
+  useAccountManager(manager: AccountManager) {
+    this.accountManager = manager;
+  }
   close() {
     this.db.close();
   }
@@ -284,6 +294,33 @@ export class WorkspaceStore {
         modelRequired: !!row.modelRequired,
       })) as unknown as Conversation[];
   }
+  /**
+   * One-time migration: Dots and conversations that ran through a project
+   * configured local harness keep that harness and model as their own route,
+   * so later project or Dot default changes never move them.
+   */
+  seedLegacyRoutes(harness: HarnessProvider | null, model: string | null) {
+    if (this.harness.meta('legacy_routes_seeded')) return;
+    if (harness && model) {
+      this.db
+        .prepare('UPDATE dots SET harness=?, model=? WHERE harness IS NULL')
+        .run(harness, model);
+      this.db
+        .prepare(
+          'UPDATE thread_bindings SET harness=?, model=? WHERE harness IS NULL',
+        )
+        .run(harness, model);
+    }
+    this.harness.setMeta('legacy_routes_seeded', String(Date.now()));
+  }
+  /** Any Dot default or existing conversation routed to a local harness. */
+  usesHarnessRouting() {
+    return !!this.db
+      .prepare(
+        'SELECT 1 FROM dots WHERE harness IS NOT NULL UNION SELECT 1 FROM thread_bindings WHERE harness IS NOT NULL LIMIT 1',
+      )
+      .get();
+  }
   /** Changes only this conversation's model. The harness stays fixed. */
   setConversationModel(id: string, model: string) {
     const thread = this.requireThread(id);
@@ -316,8 +353,10 @@ export class WorkspaceStore {
       createdAt: Date.now(),
       learningContainerId: dot.learningContainerId ?? null,
       // Copied at creation: later Dot default changes never move this thread.
-      harness: dot.harness ?? null,
-      model: dot.harness ? (dot.model ?? null) : null,
+      harness: dot.harness ?? this.projectRoute?.harness ?? null,
+      model: dot.harness
+        ? (dot.model ?? null)
+        : (this.projectRoute?.model ?? null),
       modelRequired: false,
     };
     this.db

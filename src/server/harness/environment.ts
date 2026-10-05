@@ -1,12 +1,6 @@
 import { homedir } from 'node:os';
 import { isAbsolute, join, relative, resolve } from 'node:path';
-import {
-  chmodSync,
-  existsSync,
-  mkdirSync,
-  rmSync,
-  writeFileSync,
-} from 'node:fs';
+import { chmodSync, mkdirSync, rmSync } from 'node:fs';
 import type { HarnessProvider } from '../../shared/harness.js';
 import type { AccountSnapshot } from './store.js';
 
@@ -56,13 +50,6 @@ export function ensureProfile(root: string, snapshot: AccountSnapshot) {
   const dir = profileDirectory(root, snapshot);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   chmodSync(dir, 0o700);
-  // Copilot reads user-level hooks from its home config; a managed profile
-  // starts with every hook disabled (documented `disableAllHooks`).
-  const copilotConfig = join(dir, 'config.json');
-  if (snapshot.provider === 'copilot' && !existsSync(copilotConfig))
-    writeFileSync(copilotConfig, JSON.stringify({ disableAllHooks: true }), {
-      mode: 0o600,
-    });
   return dir;
 }
 
@@ -112,42 +99,42 @@ const AUTH_OVERRIDES: Record<HarnessProvider, string[]> = {
 };
 
 /**
- * Every inherited variable the child must not see for this provider. All
- * provider profile overrides are removed (the parent may itself run under a
- * managed CLI profile); a managed account then sets its own profile explicitly.
+ * Every inherited variable a harness child must not see: credentials and
+ * endpoint overrides of every provider, every provider profile override (the
+ * parent may itself run under an Orca or agent-managed profile), agent session
+ * identifiers, Orca state, OpenTelemetry export, and shell startup hooks. The
+ * turn runtime then sets exactly the profile and credential it intends.
  */
 export function scrubbedVariables(
-  provider: HarnessProvider,
+  _provider: HarnessProvider,
   env: NodeJS.ProcessEnv = process.env,
-  keepProfile = false,
 ): string[] {
   const keys = Object.keys(env).filter(
     (key) =>
-      /(?:_KEY|_TOKEN|_SECRET)$/i.test(key) ||
+      /(?:_KEY|_TOKEN|_SECRET|_PASSWORD)$/i.test(key) ||
       /^_*(?:VARLOCK|DMNO)_/i.test(key) ||
-      /^COPILOT_PROVIDER_/i.test(key) ||
-      ['NODE_OPTIONS', 'ELECTRON_RUN_AS_NODE'].includes(key) ||
+      /^(?:ORCA|OTEL|ANTHROPIC|OPENAI|CODEX|COPILOT|CLAUDE_CODE|GH|GITHUB)_/i.test(
+        key,
+      ) ||
+      /(?:^|_)SESSION_ID$/i.test(key) ||
+      [
+        'CLAUDECODE',
+        'CLAUDE_CONFIG_DIR',
+        'NODE_OPTIONS',
+        'ELECTRON_RUN_AS_NODE',
+        'BASH_ENV',
+        'ENV',
+        'PROMPT_COMMAND',
+      ].includes(key) ||
       Object.values(AUTH_OVERRIDES).some((list) => list.includes(key)),
   );
-  const profiles = Object.entries(PROFILE_VARIABLE)
-    .filter(([owner]) => !(keepProfile && owner === provider))
-    .map(([, variable]) => variable);
-  return [...new Set([...keys, ...AUTH_OVERRIDES[provider], ...profiles])];
-}
-
-/**
- * Account-bound child variables. Managed accounts point the native CLI at
- * their private profile; the system account keeps the ordinary CLI profile and
- * OpenDots never writes to it.
- */
-export function accountVariables(
-  root: string,
-  snapshot: AccountSnapshot,
-): Record<string, string> {
-  if (snapshot.kind === 'system') return {};
-  return {
-    [PROFILE_VARIABLE[snapshot.provider]]: profileDirectory(root, snapshot),
-  };
+  return [
+    ...new Set([
+      ...keys,
+      ...Object.values(AUTH_OVERRIDES).flat(),
+      ...Object.values(PROFILE_VARIABLE),
+    ]),
+  ];
 }
 
 export function profileVariable(provider: HarnessProvider) {

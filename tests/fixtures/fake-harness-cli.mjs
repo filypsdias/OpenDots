@@ -4,7 +4,13 @@ import console from 'node:console';
 import { URL } from 'node:url';
 import { setInterval, setTimeout } from 'node:timers';
 import { createInterface } from 'node:readline';
-import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  appendFileSync,
+  existsSync,
+  readFileSync,
+  writeFileSync,
+} from 'node:fs';
+import { join } from 'node:path';
 
 // Only synthetic test metadata is recorded. Never record environment values.
 const config = JSON.parse(
@@ -33,8 +39,35 @@ const record = (extra = {}) =>
       homePresent: process.env.HOME !== undefined,
       home: process.env.HOME === config.testHome ? config.testHome : undefined,
       present: config.scrubKeys.filter((key) => key in process.env),
-      // Profile path is synthetic test data; recorded to prove account binding.
+      // Profile path is synthetic test data; recorded to prove isolation.
       profile: process.env[profile] ?? null,
+      profileFiles: process.env[profile]
+        ? ['config.toml', 'settings.json', 'auth.json', 'config.json'].filter(
+            (name) => existsSync(join(process.env[profile], name)),
+          )
+        : [],
+      codexRefreshToken:
+        provider === 'codex' && process.env.CODEX_HOME
+          ? (() => {
+              try {
+                return !!JSON.parse(
+                  readFileSync(
+                    join(process.env.CODEX_HOME, 'auth.json'),
+                    'utf8',
+                  ),
+                ).tokens?.refresh_token;
+              } catch {
+                return null;
+              }
+            })()
+          : null,
+      claudeToken:
+        provider === 'claude-code'
+          ? process.env.CLAUDE_CODE_OAUTH_TOKEN === config.claudeToken
+          : null,
+      quiet: ['CLAUDE_CODE_DISABLE_CLAUDE_MDS', 'DISABLE_TELEMETRY'].filter(
+        (key) => process.env[key] === '1',
+      ),
       ...extra,
     }) + '\n',
   );
@@ -138,7 +171,10 @@ if (provider === 'codex') {
       waiting.get(message.id)?.(message);
       return;
     }
-    if (message.method === 'initialize')
+    if (message.method === 'initialize' && config.turn === 'hang-initialize') {
+      record({ phase: 'protocol', initializeOnly: true });
+      heartbeat();
+    } else if (message.method === 'initialize')
       send({
         id: message.id,
         result: {
@@ -159,12 +195,35 @@ if (provider === 'codex') {
           ephemeral: message.params.ephemeral,
         },
       });
-      send({ id: message.id, result: { thread: { id: thread } } });
+      if (config.turn === 'early-exit-start') process.exit(0);
+      send({
+        id: message.id,
+        result: {
+          model: message.params.model,
+          thread: {
+            id: thread,
+            environments:
+              config.turn === 'environment'
+                ? [{ environmentId: 'local', cwd: process.cwd() }]
+                : config.turn === 'no-environments'
+                  ? null
+                  : [],
+          },
+        },
+      });
     } else if (message.method === 'turn/start') {
       record({
         phase: 'protocol',
-        turnStart: { environments: message.params.environments },
+        turnStart: {
+          environments: message.params.environments,
+          text: message.params.input[0].text,
+        },
       });
+      if (config.codexRefresh)
+        writeFileSync(
+          join(process.env.CODEX_HOME, 'auth.json'),
+          config.codexRefresh,
+        );
       send({ id: message.id, result: { turn: { id: 'turn-1' } } });
       const turn = config.turn;
       if (turn === 'hang') heartbeat();
@@ -198,6 +257,53 @@ if (provider === 'codex') {
           item: { type: 'agentMessage', id: 'msg-1', text: 'Tools done.' },
         });
         complete('completed');
+      } else if (turn === 'early-exit') {
+        process.exit(0);
+      } else if (turn === 'mismatch') {
+        notify('item/agentMessage/delta', {
+          threadId: 'another-thread',
+          turnId: 'turn-1',
+          itemId: 'x',
+          delta: 'leak',
+        });
+      } else if (turn === 'duplicate') {
+        const call = () =>
+          ask('item/tool/call', {
+            threadId: thread,
+            turnId: 'turn-1',
+            callId: 'same-call',
+            tool: 'create_space_page',
+            arguments: allowed,
+          });
+        const first = await call();
+        const second = await call();
+        writeFileSync(config.bridgeReceipts, JSON.stringify({ first, second }));
+      } else if (turn === 'create-then-quota' || turn === 'create-twice') {
+        const call = (callId) =>
+          ask('item/tool/call', {
+            threadId: thread,
+            turnId: 'turn-1',
+            callId,
+            tool: 'create_space_page',
+            arguments: allowed,
+          });
+        const first = await call('c1');
+        const results = [first];
+        if (turn === 'create-twice') results.push(await call('c2'));
+        appendFileSync(config.bridgeReceipts, JSON.stringify(results) + '\n');
+        if (turn === 'create-then-quota')
+          complete('failed', {
+            message: 'usage limit synthetic-api-key',
+            codexErrorInfo: 'usageLimitExceeded',
+          });
+        else {
+          notify('item/completed', {
+            threadId: thread,
+            turnId: 'turn-1',
+            item: { type: 'agentMessage', id: 'm', text: 'Done.' },
+          });
+          complete('completed');
+        }
       } else if (turn === 'native') {
         notify('item/started', {
           threadId: thread,

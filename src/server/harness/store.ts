@@ -1,5 +1,6 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
+import { HarnessTurnError } from './errors.js';
 import {
   HARNESS_LABELS,
   isHarnessProvider,
@@ -37,7 +38,136 @@ export class HarnessStore {
       CREATE TABLE IF NOT EXISTS harness_receipts(id TEXT PRIMARY KEY, threadId TEXT NOT NULL, runId TEXT NOT NULL, harness TEXT, model TEXT NOT NULL, accountId TEXT, accountLabel TEXT, outcome TEXT NOT NULL, errorKind TEXT, continuation INTEGER NOT NULL DEFAULT 0, tools TEXT NOT NULL DEFAULT '[]', startedAt INTEGER NOT NULL, finishedAt INTEGER);
       CREATE INDEX IF NOT EXISTS harness_receipts_thread ON harness_receipts(threadId, startedAt);
       CREATE TABLE IF NOT EXISTS harness_continuations(threadId TEXT PRIMARY KEY, receiptId TEXT NOT NULL, armedAt INTEGER NOT NULL);
-      CREATE TABLE IF NOT EXISTS harness_models(provider TEXT NOT NULL, accountId TEXT NOT NULL, models TEXT NOT NULL, fetchedAt INTEGER NOT NULL, PRIMARY KEY(provider, accountId));`);
+      CREATE TABLE IF NOT EXISTS harness_models(provider TEXT NOT NULL, accountId TEXT NOT NULL, models TEXT NOT NULL, fetchedAt INTEGER NOT NULL, PRIMARY KEY(provider, accountId));
+      CREATE TABLE IF NOT EXISTS harness_tool_journal(threadId TEXT NOT NULL, promptId TEXT NOT NULL, fingerprint TEXT NOT NULL, occurrence INTEGER NOT NULL, tool TEXT NOT NULL, status TEXT NOT NULL, result TEXT, receiptId TEXT, updatedAt INTEGER NOT NULL, PRIMARY KEY(threadId, promptId, fingerprint, occurrence));
+      CREATE TABLE IF NOT EXISTS harness_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);`);
+    for (const [table, column, definition] of [
+      ['harness_receipts', 'promptId', 'TEXT'],
+      ['harness_continuations', 'promptId', 'TEXT'],
+    ])
+      if (
+        !db
+          .prepare(`PRAGMA table_info(${table})`)
+          .all()
+          .some((field) => field.name === column)
+      )
+        db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    // A new server process owns no running turn: anything still marked
+    // running was interrupted by a restart. Its started tools stay unknown.
+    db.exec(
+      "UPDATE harness_receipts SET outcome='failed', errorKind=COALESCE(errorKind, 'unknown'), finishedAt=COALESCE(finishedAt, CAST(strftime('%s','now') AS INTEGER) * 1000) WHERE outcome='running'",
+    );
+  }
+
+  /** One live turn per conversation across every entry point in this process. */
+  private live = new Set<string>();
+  lockTurn(threadId: string): () => void {
+    if (this.live.has(threadId))
+      throw new HarnessTurnError(
+        'unknown',
+        'Conversation is already running a turn. Wait for it to finish, then retry.',
+      );
+    this.live.add(threadId);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.live.delete(threadId);
+    };
+  }
+  isLive(threadId: string) {
+    return this.live.has(threadId);
+  }
+
+  meta(key: string): string | null {
+    const row = this.db
+      .prepare('SELECT value FROM harness_meta WHERE key=?')
+      .get(key);
+    return typeof row?.value === 'string' ? row.value : null;
+  }
+  setMeta(key: string, value: string) {
+    this.db
+      .prepare(
+        'INSERT INTO harness_meta VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+      )
+      .run(key, value);
+  }
+
+  journalEntry(
+    threadId: string,
+    promptId: string,
+    fingerprint: string,
+    occurrence: number,
+  ):
+    | { status: 'started' | 'completed'; result: string | null; tool: string }
+    | undefined {
+    return this.db
+      .prepare(
+        'SELECT status, result, tool FROM harness_tool_journal WHERE threadId=? AND promptId=? AND fingerprint=? AND occurrence=?',
+      )
+      .get(threadId, promptId, fingerprint, occurrence) as never;
+  }
+
+  /** Records intent before execution; refuses if any record already exists. */
+  journalStart(value: {
+    threadId: string;
+    promptId: string;
+    fingerprint: string;
+    occurrence: number;
+    tool: string;
+    receiptId: string | null;
+  }): boolean {
+    return (
+      this.db
+        .prepare(
+          "INSERT OR IGNORE INTO harness_tool_journal VALUES (?, ?, ?, ?, ?, 'started', NULL, ?, ?)",
+        )
+        .run(
+          value.threadId,
+          value.promptId,
+          value.fingerprint,
+          value.occurrence,
+          value.tool,
+          value.receiptId,
+          Date.now(),
+        ).changes > 0
+    );
+  }
+
+  journalFinish(
+    key: {
+      threadId: string;
+      promptId: string;
+      fingerprint: string;
+      occurrence: number;
+    },
+    result: string | null,
+  ) {
+    if (result !== null)
+      this.db
+        .prepare(
+          "UPDATE harness_tool_journal SET status='completed', result=?, updatedAt=? WHERE threadId=? AND promptId=? AND fingerprint=? AND occurrence=?",
+        )
+        .run(
+          result,
+          Date.now(),
+          key.threadId,
+          key.promptId,
+          key.fingerprint,
+          key.occurrence,
+        );
+  }
+
+  journal(threadId: string, promptId: string) {
+    return this.db
+      .prepare(
+        'SELECT tool, status, occurrence FROM harness_tool_journal WHERE threadId=? AND promptId=? ORDER BY updatedAt',
+      )
+      .all(threadId, promptId) as Array<{
+      tool: string;
+      status: 'started' | 'completed';
+      occurrence: number;
+    }>;
   }
 
   private systemAccount(provider: HarnessProvider): HarnessAccount {
@@ -187,11 +317,12 @@ export class HarnessStore {
     model: string;
     account: AccountSnapshot | null;
     continuation: boolean;
+    promptId?: string | null;
   }): string {
     const id = randomUUID();
     this.db
       .prepare(
-        "INSERT INTO harness_receipts VALUES (?, ?, ?, ?, ?, ?, ?, 'running', NULL, ?, '[]', ?, NULL)",
+        "INSERT INTO harness_receipts (id, threadId, runId, harness, model, accountId, accountLabel, outcome, errorKind, continuation, tools, startedAt, finishedAt, promptId) VALUES (?, ?, ?, ?, ?, ?, ?, 'running', NULL, ?, '[]', ?, NULL, ?)",
       )
       .run(
         id,
@@ -203,6 +334,7 @@ export class HarnessStore {
         value.account?.label ?? null,
         +value.continuation,
         Date.now(),
+        value.promptId ?? null,
       );
     return id;
   }
@@ -247,30 +379,58 @@ export class HarnessStore {
     return this.receipts(row.threadId, 500).find((item) => item.id === id);
   }
 
-  /** Arms one explicit continuation. Re-arming the same failure is idempotent. */
-  armContinuation(threadId: string, receiptId: string) {
+  /**
+   * Arms one explicit continuation bound to the unanswered prompt message.
+   * Re-arming the same failure is idempotent.
+   */
+  armContinuation(
+    threadId: string,
+    receiptId: string,
+    promptId?: string | null,
+  ) {
+    const bound = promptId ?? this.receipt(receiptId)?.promptId ?? null;
     this.db
       .prepare(
-        'INSERT INTO harness_continuations VALUES (?, ?, ?) ON CONFLICT(threadId) DO UPDATE SET receiptId=excluded.receiptId, armedAt=excluded.armedAt',
+        'INSERT INTO harness_continuations (threadId, receiptId, armedAt, promptId) VALUES (?, ?, ?, ?) ON CONFLICT(threadId) DO UPDATE SET receiptId=excluded.receiptId, armedAt=excluded.armedAt, promptId=excluded.promptId',
       )
-      .run(threadId, receiptId, Date.now());
+      .run(threadId, receiptId, Date.now(), bound);
   }
 
-  continuation(threadId: string): string | null {
-    const row = this.db
-      .prepare('SELECT receiptId FROM harness_continuations WHERE threadId=?')
-      .get(threadId);
-    return typeof row?.receiptId === 'string' ? row.receiptId : null;
-  }
-
-  /** Atomically consumes an armed continuation so it can start only once. */
-  takeContinuation(threadId: string): string | null {
+  continuation(
+    threadId: string,
+  ): { receiptId: string; promptId: string | null } | null {
     const row = this.db
       .prepare(
-        'DELETE FROM harness_continuations WHERE threadId=? RETURNING receiptId',
+        'SELECT receiptId, promptId FROM harness_continuations WHERE threadId=?',
       )
       .get(threadId);
-    return typeof row?.receiptId === 'string' ? row.receiptId : null;
+    return typeof row?.receiptId === 'string'
+      ? {
+          receiptId: row.receiptId,
+          promptId: typeof row.promptId === 'string' ? row.promptId : null,
+        }
+      : null;
+  }
+
+  clearContinuation(threadId: string) {
+    this.db
+      .prepare('DELETE FROM harness_continuations WHERE threadId=?')
+      .run(threadId);
+  }
+
+  /**
+   * Atomically consumes the armed continuation for this exact prompt. A turn
+   * for a different (newer) user message discards the stale continuation.
+   */
+  takeContinuation(threadId: string, promptId: string | null): string | null {
+    const armed = this.continuation(threadId);
+    if (!armed) return null;
+    this.db
+      .prepare('DELETE FROM harness_continuations WHERE threadId=?')
+      .run(threadId);
+    return armed.promptId && armed.promptId === promptId
+      ? armed.receiptId
+      : null;
   }
 
   cachedModels(

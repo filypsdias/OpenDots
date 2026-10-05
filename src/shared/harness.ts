@@ -68,6 +68,8 @@ export interface TurnReceipt {
   outcome: 'running' | 'completed' | 'failed' | 'cancelled';
   errorKind: TurnErrorKind | null;
   continuation: boolean;
+  /** The user message this turn answered; binds explicit continuation. */
+  promptId: string | null;
   tools: TurnToolRecord[];
   startedAt: number;
   finishedAt: number | null;

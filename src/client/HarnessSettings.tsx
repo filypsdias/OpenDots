@@ -19,7 +19,7 @@ const STATUS: Record<HarnessAccount['status'], string> = {
   login_required: 'Sign-in required',
   login_pending: 'Waiting for sign-in…',
   unknown: 'Status unknown until checked or used',
-  unsupported: 'Not available for OpenDots turns',
+  unsupported: 'Not available on this machine',
 };
 
 /**
@@ -31,6 +31,7 @@ export function HarnessSettings() {
   const [overview, setOverview] = useState<Overview>();
   const [labels, setLabels] = useState<Record<string, string>>({});
   const [prompts, setPrompts] = useState<Record<string, LoginPrompt>>({});
+  const [codes, setCodes] = useState<Record<string, string>>({});
   const [error, setError] = useState('');
   const [working, setWorking] = useState('');
   const load = async () => {
@@ -78,9 +79,12 @@ export function HarnessSettings() {
     <div className="harness-settings">
       <p className="muted">
         Dots can run through Claude Code, Codex or GitHub Copilot CLI on this
-        machine, using your subscription. Each harness may use only OpenDots
-        tools and permissions. One account per harness is active for all new
-        turns, including scheduled work and Slack.
+        machine, using your subscription. System default reuses your ordinary
+        login read-only (Copilot: your own `copilot login`, never a GitHub CLI
+        login); OpenDots accounts (Copilot ones need the GitHub CLI to sign in)
+        keep their own credential. Each harness may use only OpenDots tools and
+        permissions. One account per harness is active for all new turns,
+        including scheduled work and Slack.
       </p>
       {HARNESS_PROVIDERS.map((provider: HarnessProvider) => {
         const status = overview.providers.find(
@@ -134,6 +138,59 @@ export function HarnessSettings() {
                             </>
                           )}
                         </small>
+                      )}
+                      {account.status === 'login_pending' && (
+                        <form
+                          className="account-add"
+                          onSubmit={(event) => {
+                            event.preventDefault();
+                            const code = codes[account.id]?.trim();
+                            if (!code) return;
+                            void act(account.id, async () => {
+                              await api(
+                                `/harness/accounts/${account.id}/login/code`,
+                                'POST',
+                                { code },
+                              );
+                              setCodes((all) => ({ ...all, [account.id]: '' }));
+                            });
+                          }}
+                        >
+                          <label
+                            className="field-label"
+                            htmlFor={`code-${account.id}`}
+                          >
+                            Paste a code if the sign-in page shows one
+                          </label>
+                          <input
+                            id={`code-${account.id}`}
+                            value={codes[account.id] ?? ''}
+                            maxLength={512}
+                            autoComplete="off"
+                            onChange={(event) =>
+                              setCodes((all) => ({
+                                ...all,
+                                [account.id]: event.target.value,
+                              }))
+                            }
+                          />
+                          <button disabled={!!working}>Submit code</button>
+                          <button
+                            type="button"
+                            disabled={!!working}
+                            onClick={() =>
+                              void act(account.id, () =>
+                                api(
+                                  `/harness/accounts/${account.id}/login/cancel`,
+                                  'POST',
+                                  {},
+                                ),
+                              )
+                            }
+                          >
+                            Cancel sign-in
+                          </button>
+                        </form>
                       )}
                     </div>
                     <div className="account-actions">

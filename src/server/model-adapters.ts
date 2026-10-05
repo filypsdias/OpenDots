@@ -8,24 +8,28 @@ import {
   resolveModel,
   type ResolvedModel,
 } from './models.js';
-import {
-  assertHarnessRuntime,
-  harnessEnvironment,
-  HarnessSetupError,
-} from './harness-runtime.js';
-import type { SandboxHandle } from '@tanstack/ai-sandbox';
+import { assertHarnessRuntime, harnessEnvironment } from './harness-runtime.js';
 export type { ResolvedModel };
 import type { HarnessProvider } from '../shared/harness.js';
 import type { AccountSnapshot } from './harness/store.js';
-import { accountVariables, scrubbedVariables } from './harness/environment.js';
+import { scrubbedVariables } from './harness/environment.js';
 import {
   CLAUDE_ADAPTER_POLICY,
   CLAUDE_WRAPPER,
   claudeWrapperScript,
 } from './harness/policy.js';
 import { CodexAppServerAdapter } from './harness/codex-app-server.js';
-import { copilotText } from './harness/copilot-adapter.js';
-import { defaultExec, parseAuthStatus } from './harness/accounts.js';
+import {
+  copilotText,
+  type CopilotTextConfig,
+} from './harness/copilot-adapter.js';
+import {
+  childEnvironment,
+  COPILOT_TOKEN_VARIABLE,
+  prepareRuntime,
+  type TurnCredential,
+} from './harness/runtime.js';
+import { sanitizedAdapter } from './harness/errors.js';
 
 export function resolveActiveModel(config: PlatformConfig): ResolvedModel {
   return resolveModel({
@@ -82,75 +86,12 @@ export interface HarnessTurn {
   /** Base directory for per-thread scratch directories. */
   cwd: string;
   profileRoot: string;
-  /** Claude permission mode is fixed by policy; kept for legacy config validation. */
-  claudePermissionMode?: string;
-}
-
-const LOGIN_GUIDANCE: Record<
-  HarnessProvider,
-  { missing: string; login: string }
-> = {
-  'claude-code': {
-    missing:
-      'Claude CLI is unavailable. Install Claude Code, run claude auth login on this machine, then retry.',
-    login:
-      'Claude subscription login is required. Run claude auth login on this machine (or sign in the selected account in Settings), then retry. API-key login is not a subscription.',
-  },
-  codex: {
-    missing:
-      'Codex CLI is unavailable. Install Codex, run codex login on this machine, then retry.',
-    login:
-      'ChatGPT subscription login is required. Run codex login on this machine (or sign in the selected account in Settings), then retry. API-key login is not a subscription.',
-  },
-  copilot: {
-    missing: 'GitHub Copilot CLI is unavailable. Install it, then retry.',
-    login:
-      'GitHub Copilot login is required. Sign in the selected account in Settings, then retry.',
-  },
-};
-
-function requireLogin(
-  provider: HarnessProvider,
-  result: { exitCode: number; stdout: string; stderr: string },
-) {
-  if (result.exitCode === 127)
-    throw new HarnessSetupError(LOGIN_GUIDANCE[provider].missing);
-  if (parseAuthStatus(provider, result).status !== 'ready')
-    throw new HarnessSetupError(LOGIN_GUIDANCE[provider].login);
-}
-
-async function sandboxLogin(
-  handle: SandboxHandle,
-  provider: 'claude-code',
-  env: Record<string, string>,
-  signal?: AbortSignal,
-) {
-  const statusSignal = AbortSignal.any([
-    AbortSignal.timeout(10_000),
-    ...(signal ? [signal] : []),
-  ]);
-  // local-process exec subscribes to future aborts only; refuse an already
-  // aborted probe before it spawns and never accept partial output after abort.
-  statusSignal.throwIfAborted();
-  const result = await handle.process
-    .exec('claude auth status --json', {
-      signal: statusSignal,
-      env: {
-        ...env,
-        ...(process.platform === 'win32' &&
-        !process.env.HOME &&
-        process.env.USERPROFILE
-          ? { HOME: process.env.USERPROFILE }
-          : {}),
-      },
-    })
-    .catch(() => {
-      throw new HarnessSetupError(
-        'The CLI subscription login check could not finish. Check the installed CLI and login on this machine, then retry.',
-      );
-    });
-  statusSignal.throwIfAborted();
-  requireLogin(provider, result);
+  /** Resolves the account's credential (never the ambient machine login). */
+  credential: () => Promise<TurnCredential>;
+  /** Persists refreshed managed Codex tokens (compare-and-swap). */
+  onCodexRefresh?: (original: string, refreshed: string) => void;
+  /** Test seam for the Copilot SDK client. */
+  createCopilotClient?: CopilotTextConfig['createClient'];
 }
 
 function scopeDirectory(
@@ -164,55 +105,55 @@ function scopeDirectory(
 }
 
 /**
- * Builds the adapter for one harness turn. The account snapshot decides the
- * child profile; the parent's credentials and profile overrides are scrubbed.
+ * Builds the adapter for one harness turn. Each turn runs with a fresh,
+ * empty runtime home and only the account's credential, so no ordinary or
+ * Orca profile configuration, plugin, hook, MCP server or instruction loads.
  */
 export async function harnessAdapterFor(
   turn: HarnessTurn,
   scope: { dotId: string; threadId: string; signal?: AbortSignal },
 ) {
   assertHarnessRuntime({ provider: turn.harness, ...harnessEnvironment() });
-  const managed = turn.account.kind === 'managed';
-  const accountEnv = accountVariables(turn.profileRoot, turn.account);
-  const scrub = scrubbedVariables(turn.harness, process.env, managed);
+  scope.signal?.throwIfAborted();
+  const credential = await turn.credential();
+  scope.signal?.throwIfAborted();
+  const runtime = prepareRuntime(turn.profileRoot, credential);
+  const dispose = () => {
+    const refreshed = runtime.refreshedCodexAuth();
+    if (refreshed)
+      turn.onCodexRefresh?.(refreshed.original, refreshed.refreshed);
+    runtime.dispose();
+  };
   const { scopeId, dir } = scopeDirectory(turn, scope);
-  // The SDK serializes thrown errors into events. Keep safe setup guidance
-  // separately so no provider error payload needs to be trusted or forwarded.
-  let setupError: HarnessSetupError | undefined;
-  if (turn.harness === 'codex') {
-    scope.signal?.throwIfAborted();
-    mkdirSync(dir, { recursive: true, mode: 0o700 });
-    const env: NodeJS.ProcessEnv = { ...process.env };
-    for (const key of scrub) delete env[key];
-    Object.assign(env, accountEnv);
-    const signal = AbortSignal.any([
-      AbortSignal.timeout(10_000),
-      ...(scope.signal ? [scope.signal] : []),
-    ]);
-    const result = await Promise.race([
-      defaultExec(
-        'codex',
-        ['login', 'status'],
-        { ...env, PWD: dir },
-        10_000,
-        dir,
-        signal,
-      ),
-      new Promise<never>((_, reject) =>
-        signal.addEventListener('abort', () => reject(signal.reason), {
-          once: true,
-        }),
-      ),
-    ]);
-    signal.throwIfAborted();
-    requireLogin('codex', result);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  if (credential.provider === 'copilot') {
+    const { [COPILOT_TOKEN_VARIABLE]: _token, ...env } = runtime.env;
+    void _token;
     return {
-      kind: 'codex' as const,
-      adapter: new CodexAppServerAdapter({ cwd: dir, env }, turn.model),
+      kind: 'copilot' as const,
+      adapter: copilotText(turn.model, {
+        cwd: dir,
+        home: runtime.home,
+        // The SDK passes the token to the CLI itself.
+        env: childEnvironment({ env, scrub: runtime.scrub }),
+        githubToken: credential.githubToken,
+        createClient: turn.createCopilotClient,
+        signal: scope.signal,
+      }),
       middleware: [],
-      setupError: () => setupError,
+      dispose,
     };
   }
+  if (turn.harness === 'codex')
+    return {
+      kind: 'codex' as const,
+      adapter: new CodexAppServerAdapter(
+        { cwd: dir, env: childEnvironment(runtime), signal: scope.signal },
+        turn.model,
+      ),
+      middleware: [],
+      dispose,
+    };
   const { defineSandbox, withSandbox } = await import('@tanstack/ai-sandbox');
   const { localProcessSandbox } =
     await import('@tanstack/ai-sandbox-local-process');
@@ -222,24 +163,18 @@ export async function harnessAdapterFor(
     provider: localProcessSandbox({
       dir,
       removeOnDestroy: false,
-      scrubEnv: scrub,
+      scrubEnv: runtime.scrub,
     }),
     lifecycle: { reuse: 'none', snapshot: 'none', destroyOnComplete: true },
     fileEvents: false,
     hooks: {
       onReady: async (handle) => {
-        try {
-          if (turn.harness === 'claude-code') {
-            await sandboxLogin(handle, 'claude-code', accountEnv, scope.signal);
-            await handle.fs.write(
-              `/workspace/${CLAUDE_WRAPPER}`,
-              claudeWrapperScript(),
-            );
-            await handle.process.exec(`chmod 700 ${CLAUDE_WRAPPER}`);
-          }
-        } catch (error) {
-          if (error instanceof HarnessSetupError) setupError = error;
-          throw error;
+        if (turn.harness === 'claude-code') {
+          await handle.fs.write(
+            `/workspace/${CLAUDE_WRAPPER}`,
+            claudeWrapperScript(),
+          );
+          await handle.process.exec(`chmod 700 ${CLAUDE_WRAPPER}`);
         }
       },
     },
@@ -249,23 +184,20 @@ export async function harnessAdapterFor(
     const mod = await import('@tanstack/ai-claude-code');
     return {
       kind: 'claude-code' as const,
-      adapter: mod.claudeCodeText(turn.model, {
-        cwd: '/workspace',
-        authMode: 'host',
-        claudeExecutable: `./${CLAUDE_WRAPPER}`,
-        env: accountEnv,
-        ...CLAUDE_ADAPTER_POLICY,
-      }),
+      adapter: sanitizedAdapter(
+        mod.claudeCodeText(turn.model, {
+          cwd: '/workspace',
+          authMode: 'host',
+          claudeExecutable: `./${CLAUDE_WRAPPER}`,
+          env: runtime.env,
+          ...CLAUDE_ADAPTER_POLICY,
+        }),
+      ),
       middleware,
-      setupError: () => setupError,
+      dispose,
     };
   }
-  return {
-    kind: 'copilot' as const,
-    adapter: copilotText(turn.model, { cwd: '/workspace', env: accountEnv }),
-    middleware,
-    setupError: () => setupError,
-  };
+  throw new Error('Unsupported harness.');
 }
 
 /** Legacy permission-mode validation is still applied to project config. */

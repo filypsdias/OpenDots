@@ -30,6 +30,8 @@ export interface PlatformConfig extends WebConfig {
   codexAuthMode?: string;
   codexModel?: string;
   codexCwd?: string;
+  // GitHub Copilot CLI harness scratch directory.
+  copilotCwd?: string;
   modelFallbacks?: string[];
   computerSupervisorUrl?: string;
   computerSupervisorToken?: string;
@@ -56,6 +58,9 @@ export function setupStatus(
   config: PlatformConfig,
   slack = 'not_configured',
   activationFailed = false,
+  // When any Dot routes to a local harness, readiness is per conversation and
+  // provider; an incomplete project model only blocks conversations using it.
+  harnessRouting = false,
 ): SetupStatus {
   let hasModel = false;
   let modelError: string | undefined;
@@ -70,7 +75,7 @@ export function setupStatus(
   }
   const missing = [
     !config.intelligenceKey?.trim() && 'CPK_INTELLIGENCE_API_KEY',
-    modelError,
+    !harnessRouting && modelError,
   ].filter((item): item is string => !!item);
   const declaredSlack = !!(
     config.slackChannel &&
@@ -86,7 +91,7 @@ export function setupStatus(
       : 'not_configured';
   return {
     intelligence: !!config.intelligenceKey?.trim(),
-    model: hasModel,
+    model: hasModel || harnessRouting,
     browser: !!(config.browserUrl && config.browserSecret),
     voice: !!(config.voiceKey && config.voiceModel && !missing.length),
     slack,

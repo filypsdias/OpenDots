@@ -1,3 +1,4 @@
+import type { HarnessProvider } from './harness.js';
 export type Status =
   'queued' | 'running' | 'paused' | 'completed' | 'failed' | 'cancelled';
 export interface Settings {
@@ -81,6 +82,9 @@ export interface Dot {
   createdAt: number;
   learningContainerId?: string | null;
   skillDeliveryEnabled?: boolean;
+  /** Default harness for new conversations; null uses the project model. */
+  harness?: HarnessProvider | null;
+  model?: string | null;
 }
 export interface Conversation {
   id: string;
@@ -90,6 +94,10 @@ export interface Conversation {
   createdAt: number;
   /** Frozen at creation; null means this conversation does not participate. */
   learningContainerId?: string | null;
+  /** Copied from the Dot at creation and never changed afterwards. */
+  harness?: HarnessProvider | null;
+  model?: string | null;
+  modelRequired?: boolean;
 }
 export interface CallReceipt {
   anchorMessageId?: string | null;

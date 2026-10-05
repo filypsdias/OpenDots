@@ -3,11 +3,19 @@ import { pageReviewTool } from '../shared/page-review.js';
 import { ComputerService } from './computer-service.js';
 import { computerTools } from './computer-tools.js';
 import { pageAccess, pageTools } from './page-tools.js';
+import { harnessAdapterFor, httpAdapterFor } from './model-adapters.js';
+import { resolveTurnRoute, type TurnRoute } from './harness/routing.js';
 import {
-  harnessAdapterFor,
-  httpAdapterFor,
-  resolveActiveModel,
-} from './model-adapters.js';
+  classifyHarnessFailure,
+  HarnessTurnError,
+  safeTurnMessage,
+} from './harness/errors.js';
+import { continuationNote } from './harness/continuation.js';
+import type {
+  HarnessProvider,
+  TurnErrorKind,
+  TurnToolRecord,
+} from '../shared/harness.js';
 import { AbstractAgent } from '@ag-ui/client';
 import { type BaseEvent, type RunAgentInput, EventType } from '@ag-ui/core';
 import {
@@ -31,15 +39,37 @@ const channelError = () => ({
   message:
     'OpenDots could not complete this request. Please check the app and try again.',
 });
-const harnessError = (input: RunAgentInput, error?: unknown) => ({
+const harnessError = (
+  input: RunAgentInput,
+  error: unknown,
+  provider: HarnessProvider | null,
+  kind: TurnErrorKind,
+) => ({
   type: EventType.RUN_ERROR,
   threadId: input.threadId,
   runId: input.runId,
   message:
-    error instanceof HarnessSetupError
+    error instanceof HarnessSetupError || error instanceof HarnessTurnError
       ? error.message
-      : 'The subscription CLI could not complete this turn. Check its local login and permissions, then retry.',
+      : safeTurnMessage(kind, provider),
 });
+/** Raw provider text is classified, then discarded; it is never forwarded. */
+const errorKind = (error: unknown): TurnErrorKind =>
+  error instanceof HarnessTurnError
+    ? error.kind
+    : error instanceof HarnessSetupError
+      ? /unavailable|install/i.test(error.message)
+        ? 'missing_cli'
+        : /login is required/i.test(error.message)
+          ? 'auth'
+          : 'unknown'
+      : classifyHarnessFailure(
+          error instanceof Error
+            ? error.message
+            : typeof error === 'string'
+              ? error
+              : '',
+        );
 export class DotAgent extends AbstractAgent {
   private inner?: BuiltInAgent;
   private controller?: AbortController;
@@ -72,9 +102,58 @@ export class DotAgent extends AbstractAgent {
       let subscription: { unsubscribe(): void } | undefined;
       let watcher: ReturnType<typeof setInterval> | undefined;
       let harness = false;
+      let route: TurnRoute | undefined;
+      let provider: HarnessProvider | null = null;
       let setupError: () => HarnessSetupError | undefined = () => undefined;
       let errorEmitted = false;
+      let receiptId: string | undefined;
+      let releaseAccount: (() => void) | undefined;
+      const toolRecords = new Map<string, TurnToolRecord>();
+      const ledger = this.workspace.harness;
+      const settle = (
+        outcome: 'completed' | 'failed' | 'cancelled',
+        kind: TurnErrorKind | null = null,
+      ) => {
+        releaseAccount?.();
+        releaseAccount = undefined;
+        if (!receiptId) return;
+        const tools = [...toolRecords.values()].map((tool) =>
+          tool.status === 'started' && outcome !== 'completed'
+            ? { ...tool, status: 'unknown' as const }
+            : tool,
+        );
+        ledger.recordTools(receiptId, tools);
+        ledger.finishReceipt(receiptId, outcome, kind);
+        if (kind === 'model' && route?.kind === 'harness')
+          this.workspace.requireConversationModel(input.threadId);
+      };
       const timeout = setTimeout(() => this.abortRun(), 90_000);
+      // Local receipt of tool activity, so recovery can tell completed tool
+      // results from interrupted ones with unknown outcome.
+      const track = (event: BaseEvent) => {
+        const value = event as BaseEvent & {
+          toolCallId?: string;
+          toolCallName?: string;
+          content?: unknown;
+        };
+        if (event.type === EventType.TOOL_CALL_START && value.toolCallId)
+          toolRecords.set(value.toolCallId, {
+            id: value.toolCallId,
+            name: value.toolCallName ?? 'tool',
+            status: 'started',
+          });
+        if (event.type === EventType.TOOL_CALL_RESULT && value.toolCallId) {
+          const record = toolRecords.get(value.toolCallId);
+          if (record)
+            record.status =
+              typeof value.content === 'string' &&
+              /^\{"status":"interrupted"\}$/.test(value.content)
+                ? 'unknown'
+                : 'completed';
+        }
+        if (receiptId && toolRecords.size)
+          ledger.recordTools(receiptId, [...toolRecords.values()]);
+      };
       // Harness adapters (Claude/Codex subscriptions) lazy-load their CLI
       // modules, so the whole run body is async. Errors funnel to the same
       // RUN_ERROR path as before.
@@ -101,10 +180,47 @@ export class DotAgent extends AbstractAgent {
             throw new Error(
               'Intelligence and model configuration are required.',
             );
-          // Throws with an actionable message when the selected provider slot
-          // (OPENAI_*, ANTHROPIC_*, CLINE_*, CLAUDE_*, CODEX_*) is incomplete.
-          const resolved = resolveActiveModel(this.config);
-          harness = resolved.harness;
+          // One resolver for every entry point. The account is snapshotted
+          // here; a later global selection change never affects this turn.
+          provider = conversation.harness ?? null;
+          harness = !!provider;
+          const continued = ledger.takeContinuation(input.threadId);
+          try {
+            route = resolveTurnRoute(
+              this.workspace,
+              this.config,
+              input.threadId,
+            );
+          } catch (error) {
+            if (error instanceof HarnessTurnError) {
+              receiptId = ledger.startReceipt({
+                threadId: input.threadId,
+                runId: input.runId,
+                harness: provider,
+                model: conversation.model ?? '',
+                account: null,
+                continuation: !!continued,
+              });
+              throw error;
+            }
+            throw error;
+          }
+          if (route.kind === 'harness') {
+            provider = route.harness;
+            harness = true;
+            releaseAccount = this.workspace.accounts.acquire(route.account.id);
+          }
+          receiptId = ledger.startReceipt({
+            threadId: input.threadId,
+            runId: input.runId,
+            harness: route.kind === 'harness' ? route.harness : null,
+            model: route.model,
+            account: route.kind === 'harness' ? route.account : null,
+            continuation: !!continued,
+          });
+          const continuation = continued
+            ? ledger.receipt(continued)
+            : undefined;
           const initialSettings = this.store.settings();
           const check = () => {
             const settings = this.store.settings();
@@ -301,13 +417,28 @@ export class DotAgent extends AbstractAgent {
           const runtime:
             | Awaited<ReturnType<typeof harnessAdapterFor>>
             | { kind: 'http'; adapter: ReturnType<typeof httpAdapterFor> } =
-            resolved.harness
-              ? await harnessAdapterFor(resolved, {
-                  dotId: dot.id,
-                  threadId: input.threadId,
-                  signal: controller.signal,
-                })
-              : { kind: 'http', adapter: httpAdapterFor(resolved) };
+            route.kind === 'harness'
+              ? await harnessAdapterFor(
+                  {
+                    harness: route.harness,
+                    model: route.model,
+                    account: route.account,
+                    cwd:
+                      (route.harness === 'claude-code'
+                        ? this.config.claudeCwd
+                        : route.harness === 'codex'
+                          ? this.config.codexCwd
+                          : this.config.copilotCwd
+                      )?.trim() || `.opendots/harnesses/${route.harness}`,
+                    profileRoot: this.workspace.accounts.root,
+                  },
+                  {
+                    dotId: dot.id,
+                    threadId: input.threadId,
+                    signal: controller.signal,
+                  },
+                )
+              : { kind: 'http', adapter: httpAdapterFor(route.resolved) };
           if (runtime.kind !== 'http') setupError = runtime.setupError;
           check();
           const serverTools = [
@@ -330,13 +461,23 @@ export class DotAgent extends AbstractAgent {
                 : undefined,
             factory: (ctx) => {
               check();
+              const trusted = ctx.input.messages.filter(
+                (message) =>
+                  message.role !== 'system' && message.role !== 'developer',
+              );
               const converted = convertInputToTanStackAI({
                 ...ctx.input,
                 // Match BuiltInAgent's default trust boundary for client messages.
-                messages: ctx.input.messages.filter(
-                  (message) =>
-                    message.role !== 'system' && message.role !== 'developer',
-                ),
+                messages: continuation
+                  ? [
+                      ...trusted,
+                      {
+                        id: `${input.runId}-continue`,
+                        role: 'user' as const,
+                        content: continuationNote(trusted, continuation),
+                      },
+                    ]
+                  : trusted,
               });
               const tools = [
                 ...tanstackTools(serverTools),
@@ -357,20 +498,20 @@ export class DotAgent extends AbstractAgent {
                 runId: ctx.input.runId,
                 tools,
               };
-              if (runtime.kind === 'claude-code') {
+              if (runtime.kind === 'claude-code')
                 return chat({
                   ...options,
                   adapter: runtime.adapter,
-                  middleware: [runtime.middleware],
+                  middleware: runtime.middleware,
                 });
-              }
-              if (runtime.kind === 'codex') {
+              if (runtime.kind === 'codex')
+                return chat({ ...options, adapter: runtime.adapter });
+              if (runtime.kind === 'copilot')
                 return chat({
                   ...options,
                   adapter: runtime.adapter,
-                  middleware: [runtime.middleware],
+                  middleware: runtime.middleware,
                 });
-              }
               return chat({
                 ...options,
                 adapter: runtime.adapter,
@@ -395,39 +536,70 @@ export class DotAgent extends AbstractAgent {
             })
             .subscribe({
               next: (event) => {
-                if (harness && event.type === EventType.RUN_ERROR) {
-                  if (errorEmitted) return;
-                  errorEmitted = true;
-                }
-                subscriber.next(
-                  event.type === EventType.RUN_ERROR
-                    ? this.channel
+                track(event);
+                if (event.type === EventType.RUN_ERROR) {
+                  const raw =
+                    setupError() ?? ('message' in event ? event.message : '');
+                  const kind = controller.signal.aborted
+                    ? null
+                    : errorKind(raw);
+                  settle(kind ? 'failed' : 'cancelled', kind);
+                  if (harness) {
+                    if (errorEmitted) return;
+                    errorEmitted = true;
+                  }
+                  subscriber.next(
+                    this.channel
                       ? channelError()
                       : harness
-                        ? harnessError(input, setupError())
-                        : event
-                    : event,
-                );
+                        ? harnessError(
+                            input,
+                            setupError(),
+                            provider,
+                            kind ?? 'unknown',
+                          )
+                        : event,
+                  );
+                  return;
+                }
+                if (event.type === EventType.RUN_FINISHED) settle('completed');
+                subscriber.next(event);
               },
               error: (error: unknown) => {
+                const kind = controller.signal.aborted
+                  ? null
+                  : errorKind(setupError() ?? error);
+                settle(kind ? 'failed' : 'cancelled', kind);
                 if (this.channel) {
                   if (!harness || !errorEmitted)
                     subscriber.next(channelError());
                   subscriber.complete();
                 } else if (harness) {
                   if (!errorEmitted)
-                    subscriber.next(harnessError(input, setupError() ?? error));
+                    subscriber.next(
+                      harnessError(
+                        input,
+                        setupError() ?? error,
+                        provider,
+                        kind ?? 'unknown',
+                      ),
+                    );
                   subscriber.complete();
                 } else subscriber.error(error);
               },
-              complete: () => subscriber.complete(),
+              complete: () => {
+                settle(controller.signal.aborted ? 'cancelled' : 'completed');
+                subscriber.complete();
+              },
             });
         } catch (error) {
+          const kind = controller.signal.aborted ? null : errorKind(error);
+          settle(kind ? 'failed' : 'cancelled', kind);
           subscriber.next(
             this.channel
               ? channelError()
               : harness
-                ? harnessError(input, error)
+                ? harnessError(input, error, provider, kind ?? 'unknown')
                 : {
                     type: EventType.RUN_ERROR,
                     message:
@@ -440,6 +612,7 @@ export class DotAgent extends AbstractAgent {
         }
       })();
       return () => {
+        settle('cancelled');
         clearTimeout(timeout);
         clearInterval(watcher);
         controller.abort();

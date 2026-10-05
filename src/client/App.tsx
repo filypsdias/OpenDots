@@ -605,6 +605,7 @@ export function App() {
                   onSchedule={() =>
                     setDialog({ type: 'schedule', threadId: thread.id })
                   }
+                  onManageHarnesses={() => setDialog({ type: 'harnesses' })}
                 />
               ) : (
                 <div className="new-conversation">
@@ -906,6 +907,7 @@ export function App() {
           workspace={workspace}
           onClose={() => setDialog(undefined)}
           mutate={mutate}
+          onOpen={setDialog}
         />
       )}
     </div>

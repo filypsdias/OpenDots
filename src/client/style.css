@@ -4164,3 +4164,125 @@ h3 {
   font-size: 14px;
   color: #c9e8dd;
 }
+
+/* Local harness routing: route bar, recovery and account settings. */
+.route-bar {
+  border-bottom: 1px solid var(--line);
+  padding: 8px 18px;
+  display: grid;
+  gap: 8px;
+  background: var(--surface);
+}
+.route-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 12px;
+}
+.route-chip {
+  display: inline-block;
+  font-size: 11px;
+  color: var(--blue-dark);
+  background: var(--lavender);
+  border-radius: 999px;
+  padding: 3px 9px;
+  margin-left: 6px;
+}
+.route-model {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 6px;
+}
+.route-model small {
+  flex-basis: 100%;
+}
+.route-account {
+  display: grid;
+  gap: 4px;
+}
+.route-history {
+  margin: 0;
+  font-size: 11px;
+}
+.recovery-banner {
+  border: 1px solid var(--line);
+  background: var(--card);
+  border-radius: 8px;
+  padding: 10px 12px;
+  display: grid;
+  gap: 6px;
+}
+.recovery-banner strong {
+  color: var(--danger);
+  font-size: 12px;
+}
+.recovery-banner p {
+  margin: 0;
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.6;
+}
+.recovery-banner button {
+  justify-self: start;
+}
+.link-button {
+  border: 0;
+  background: none;
+  padding: 4px 0;
+  color: var(--blue-dark);
+  font-size: 11px;
+  text-decoration: underline;
+}
+.harness-settings {
+  display: grid;
+  gap: 12px;
+  max-height: 65vh;
+  overflow-y: auto;
+}
+.account-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+.account-row {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: var(--card);
+}
+.account-row > div:first-child {
+  display: grid;
+  gap: 2px;
+}
+.account-row small {
+  font-size: 11px;
+  color: var(--muted);
+}
+.account-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+.account-actions button {
+  font-size: 11px;
+}
+.danger-button {
+  color: var(--danger);
+}
+.account-add {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 6px;
+}
+.account-add label {
+  flex-basis: 100%;
+}

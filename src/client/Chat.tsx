@@ -30,6 +30,7 @@ import type { CallReceipt, Conversation, Dot } from '../shared/types';
 import { Mascot } from './Mascot';
 import { useVoice } from './useVoice';
 import { CallView } from './CallView';
+import { RouteBar } from './HarnessRoute';
 export function Chat({
   thread,
   dot,
@@ -41,6 +42,7 @@ export function Chat({
   onSaved,
   onSchedule,
   onComputer,
+  onManageHarnesses,
 }: {
   thread: Conversation;
   dot: Dot;
@@ -52,6 +54,7 @@ export function Chat({
   onSaved: () => void;
   onSchedule: () => void;
   onComputer?: () => void;
+  onManageHarnesses?: () => void;
 }) {
   const { agent, isReady } = useAgent({
     agentId: `chat-${thread.id}`,
@@ -143,6 +146,25 @@ export function Chat({
         throw new Error(
           'The current turn returned no response. Check the runtime connection and retry.',
         );
+      onSaved();
+    } catch (e) {
+      setError(
+        e instanceof Error
+          ? e.message
+          : 'The turn failed. Your conversation remains saved.',
+      );
+    } finally {
+      setRunning(false);
+    }
+  };
+  // Owner-approved continuation: re-run the saved thread without a new user
+  // message. The server restates completed tool results and refuses replays.
+  const continueTurn = async () => {
+    if (running || !loaded || paused) return;
+    setError('');
+    setRunning(true);
+    try {
+      await copilotkit.runAgent({ agent });
       onSaved();
     } catch (e) {
       setError(
@@ -299,6 +321,12 @@ export function Chat({
           </button>
         </div>
       </header>
+      <RouteBar
+        threadId={thread.id}
+        busy={running}
+        onContinue={continueTurn}
+        onManage={() => onManageHarnesses?.()}
+      />
       {pageContext && (
         <div className="page-chat-context">
           Working on{' '}

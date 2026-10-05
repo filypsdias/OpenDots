@@ -90,6 +90,7 @@ export class Platform {
       this.handler?.channels?.status().overall ??
         (this.config.slackChannel ? 'setup_required' : 'not_configured'),
       this.channelStartupFailed,
+      this.workspace.dots().some((dot) => !!dot.harness),
     );
   }
   requireReady() {

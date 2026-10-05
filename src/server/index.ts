@@ -57,6 +57,7 @@ const config: PlatformConfig = {
   codexAuthMode: process.env.CODEX_AUTH_MODE || 'host',
   codexModel: process.env.CODEX_MODEL,
   codexCwd: process.env.CODEX_CWD,
+  copilotCwd: process.env.COPILOT_CWD,
   webSearchProvider: webSearchProvider(process.env.WEB_SEARCH_PROVIDER),
   parallelApiKey: process.env.PARALLEL_API_KEY,
   browserUrl: process.env.BROWSER_URL,

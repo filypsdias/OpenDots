@@ -1,4 +1,6 @@
 import { pageRoutes } from './page-routes.js';
+import { harnessRoutes } from './harness-routes.js';
+import { HARNESS_PROVIDERS } from '../shared/harness.js';
 import { Hono } from 'hono';
 import { z } from 'zod';
 import { Platform } from './platform.js';
@@ -17,11 +19,24 @@ const dotSchema = z
     skillDeliveryEnabled: z.boolean().optional(),
     spaceIds: z.array(z.string().min(1)).min(1).max(100).optional(),
     spaceId: z.string().min(1).optional(),
+    // Default route for new conversations; null keeps the project model.
+    harness: z.enum(HARNESS_PROVIDERS).nullable().optional(),
+    model: z
+      .string()
+      .trim()
+      .max(200)
+      .regex(/^[\w.:/@+-]*$/)
+      .nullable()
+      .optional(),
   })
-  .strict();
+  .strict()
+  .refine((dot) => !dot.harness || !!dot.model?.trim(), {
+    message: 'Choose a model for the selected harness.',
+  });
 export function workspaceRoutes(platform: Platform, voice: VoiceService) {
   const app = new Hono();
   app.route('/', pageRoutes(platform));
+  app.route('/', harnessRoutes(platform));
   app.get('/workspace', (c) =>
     c.json({
       spaces: platform.workspace.spaces(),
@@ -50,10 +65,8 @@ export function workspaceRoutes(platform: Platform, voice: VoiceService) {
     );
   });
   app.post('/dots', async (c) => {
-    const data = dotSchema
-      .extend({ spaceId: z.string() })
-      .safeParse(await c.req.json());
-    if (!data.success)
+    const data = dotSchema.safeParse(await c.req.json());
+    if (!data.success || !data.data.spaceId)
       return c.json(
         {
           error:
@@ -61,6 +74,7 @@ export function workspaceRoutes(platform: Platform, voice: VoiceService) {
         },
         400,
       );
+    const spaceId = data.data.spaceId;
     try {
       validateLearningSettings(
         data.data.learningContainerId ?? null,
@@ -79,7 +93,7 @@ export function workspaceRoutes(platform: Platform, voice: VoiceService) {
     }
     return c.json(
       platform.workspace.createDot(
-        data.data.spaceId,
+        spaceId,
         data.data.name,
         data.data.instructions,
         data.data.researchAllowed,
@@ -87,6 +101,7 @@ export function workspaceRoutes(platform: Platform, voice: VoiceService) {
         data.data.spaceIds,
         data.data.learningContainerId,
         data.data.skillDeliveryEnabled,
+        { harness: data.data.harness ?? null, model: data.data.model ?? null },
       ),
       201,
     );
@@ -203,7 +218,7 @@ export function workspaceRoutes(platform: Platform, voice: VoiceService) {
   app.onError((error, c) => {
     const text = error.message;
     const known =
-      /^(Setup|Voice setup|Dot |Space |Specialist |Conversation |Call |This call|End the current|Voice provider|An audio|Intelligence could not)/.test(
+      /^(Setup|Voice setup|Dot |Space |Specialist |Conversation |Call |This call|End the current|Voice provider|An audio|Intelligence could not|Account |Sign in |OpenDots never|The system default|Harness profiles)/.test(
         text,
       );
     return c.json(

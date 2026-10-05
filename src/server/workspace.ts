@@ -1,4 +1,8 @@
 import { ComputerStore } from './computer-store.js';
+import { HarnessStore } from './harness/store.js';
+import { AccountManager } from './harness/accounts.js';
+import { profileRoot } from './harness/environment.js';
+import { isHarnessProvider, type HarnessProvider } from '../shared/harness.js';
 import { Pages } from './pages.js';
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
@@ -10,6 +14,7 @@ export class WorkspaceStore {
   private db: DatabaseSync;
   readonly pages: Pages;
   readonly computers: ComputerStore;
+  readonly harness: HarnessStore;
   constructor(
     path: string,
     readonly ownerId: string,
@@ -27,6 +32,12 @@ export class WorkspaceStore {
       ['dots', 'learningContainerId', 'TEXT'],
       ['dots', 'skillDeliveryEnabled', 'INTEGER NOT NULL DEFAULT 0'],
       ['thread_bindings', 'learningContainerId', 'TEXT'],
+      // Local harness routing. NULL keeps the project-configured provider.
+      ['dots', 'harness', 'TEXT'],
+      ['dots', 'model', 'TEXT'],
+      ['thread_bindings', 'harness', 'TEXT'],
+      ['thread_bindings', 'model', 'TEXT'],
+      ['thread_bindings', 'modelRequired', 'INTEGER NOT NULL DEFAULT 0'],
     ]) {
       if (
         !this.db
@@ -50,6 +61,7 @@ export class WorkspaceStore {
         COMMIT;`);
     }
     this.computers = new ComputerStore(this.db);
+    this.harness = new HarnessStore(this.db);
     this.pages = new Pages(this.db, (id) =>
       this.spaces().some((space) => space.id === id),
     );
@@ -73,6 +85,12 @@ export class WorkspaceStore {
         true,
       );
     }
+  }
+  private accountManager?: AccountManager;
+  /** One account manager per workspace, so in-flight turns are tracked once. */
+  get accounts(): AccountManager {
+    this.accountManager ??= new AccountManager(this.harness, profileRoot());
+    return this.accountManager;
   }
   close() {
     this.db.close();
@@ -109,6 +127,8 @@ export class WorkspaceStore {
         researchAllowed: !!row.researchAllowed,
         memoryAllowed: !!row.memoryAllowed,
         skillDeliveryEnabled: !!row.skillDeliveryEnabled,
+        harness: isHarnessProvider(row.harness) ? row.harness : null,
+        model: typeof row.model === 'string' ? row.model : null,
       })) as unknown as Dot[];
   }
   dot(id: string) {
@@ -123,8 +143,11 @@ export class WorkspaceStore {
     spaceIds: string[] = [spaceId],
     learningContainerId: string | null = null,
     skillDeliveryEnabled = false,
+    route: { harness?: HarnessProvider | null; model?: string | null } = {},
   ): Dot {
     this.validateSpaceAccess(spaceId, spaceIds);
+    const harness = route.harness ?? null;
+    const model = harness ? route.model?.trim() || null : null;
     validateLearningSettings(learningContainerId, skillDeliveryEnabled);
     const dot: Dot = {
       id: randomUUID(),
@@ -136,13 +159,15 @@ export class WorkspaceStore {
       memoryAllowed,
       learningContainerId,
       skillDeliveryEnabled,
+      harness,
+      model,
       createdAt: Date.now(),
     };
     this.db.exec('BEGIN');
     try {
       this.db
         .prepare(
-          'INSERT INTO dots (id, spaceId, name, instructions, researchAllowed, memoryAllowed, createdAt, learningContainerId, skillDeliveryEnabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+          'INSERT INTO dots (id, spaceId, name, instructions, researchAllowed, memoryAllowed, createdAt, learningContainerId, skillDeliveryEnabled, harness, model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
         )
         .run(
           dot.id,
@@ -154,6 +179,8 @@ export class WorkspaceStore {
           dot.createdAt,
           learningContainerId,
           +skillDeliveryEnabled,
+          harness,
+          model,
         );
       for (const id of dot.spaceIds)
         this.db.prepare('INSERT INTO dot_spaces VALUES (?, ?)').run(dot.id, id);
@@ -186,6 +213,8 @@ export class WorkspaceStore {
       spaceIds?: string[];
       learningContainerId?: string | null;
       skillDeliveryEnabled?: boolean;
+      harness?: HarnessProvider | null;
+      model?: string | null;
     },
   ): Dot {
     const current = this.dot(id);
@@ -218,6 +247,20 @@ export class WorkspaceStore {
       this.db
         .prepare('UPDATE dots SET spaceId=? WHERE id=?')
         .run(defaultSpace, id);
+      // Dot defaults only seed new conversations; existing ones keep their route.
+      if (patch.harness !== undefined || patch.model !== undefined) {
+        const harness =
+          patch.harness === undefined
+            ? (current.harness ?? null)
+            : patch.harness;
+        const model = harness
+          ? (patch.model === undefined ? current.model : patch.model)?.trim() ||
+            null
+          : null;
+        this.db
+          .prepare('UPDATE dots SET harness=?, model=? WHERE id=?')
+          .run(harness, model, id);
+      }
       this.db.prepare('DELETE FROM dot_spaces WHERE dotId=?').run(id);
       for (const space of new Set(spaceIds))
         this.db.prepare('INSERT INTO dot_spaces VALUES (?, ?)').run(id, space);
@@ -233,7 +276,34 @@ export class WorkspaceStore {
       .prepare(
         'SELECT * FROM thread_bindings WHERE ownerId=? ORDER BY createdAt DESC',
       )
-      .all(this.ownerId) as unknown as Conversation[];
+      .all(this.ownerId)
+      .map((row) => ({
+        ...row,
+        harness: isHarnessProvider(row.harness) ? row.harness : null,
+        model: typeof row.model === 'string' ? row.model : null,
+        modelRequired: !!row.modelRequired,
+      })) as unknown as Conversation[];
+  }
+  /** Changes only this conversation's model. The harness stays fixed. */
+  setConversationModel(id: string, model: string) {
+    const thread = this.requireThread(id);
+    if (!thread.harness)
+      throw new Error(
+        'Conversation uses the project model configuration; change it in server settings.',
+      );
+    this.db
+      .prepare(
+        'UPDATE thread_bindings SET model=?, modelRequired=0 WHERE id=? AND ownerId=?',
+      )
+      .run(model, id, this.ownerId);
+    return this.requireThread(id);
+  }
+  requireConversationModel(id: string) {
+    this.db
+      .prepare(
+        'UPDATE thread_bindings SET modelRequired=1 WHERE id=? AND ownerId=?',
+      )
+      .run(id, this.ownerId);
   }
   bindThread(id: string, dotId: string, title: string): Conversation {
     const dot = this.dot(dotId);
@@ -245,10 +315,14 @@ export class WorkspaceStore {
       title,
       createdAt: Date.now(),
       learningContainerId: dot.learningContainerId ?? null,
+      // Copied at creation: later Dot default changes never move this thread.
+      harness: dot.harness ?? null,
+      model: dot.harness ? (dot.model ?? null) : null,
+      modelRequired: false,
     };
     this.db
       .prepare(
-        'INSERT INTO thread_bindings (id, dotId, ownerId, title, createdAt, learningContainerId) VALUES (?, ?, ?, ?, ?, ?)',
+        'INSERT INTO thread_bindings (id, dotId, ownerId, title, createdAt, learningContainerId, harness, model) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
       )
       .run(
         id,
@@ -257,6 +331,8 @@ export class WorkspaceStore {
         title,
         value.createdAt,
         value.learningContainerId ?? null,
+        value.harness ?? null,
+        value.model ?? null,
       );
     return value;
   }

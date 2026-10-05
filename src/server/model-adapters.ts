@@ -28,6 +28,7 @@ import {
   COPILOT_TOKEN_VARIABLE,
   prepareRuntime,
   type TurnCredential,
+  type TurnRuntime,
 } from './harness/runtime.js';
 import { sanitizedAdapter } from './harness/errors.js';
 
@@ -89,7 +90,10 @@ export interface HarnessTurn {
   /** Resolves the account's credential (never the ambient machine login). */
   credential: () => Promise<TurnCredential>;
   /** Persists refreshed managed Codex tokens (compare-and-swap). */
-  onCodexRefresh?: (original: string, refreshed: string) => void;
+  onCodexRefresh?: (
+    original: string,
+    refreshed: string,
+  ) => Promise<unknown> | void;
   /** Test seam for the Copilot SDK client. */
   createCopilotClient?: CopilotTextConfig['createClient'];
 }
@@ -118,12 +122,7 @@ export async function harnessAdapterFor(
   const credential = await turn.credential();
   scope.signal?.throwIfAborted();
   const runtime = prepareRuntime(turn.profileRoot, credential);
-  const dispose = () => {
-    const refreshed = runtime.refreshedCodexAuth();
-    if (refreshed)
-      turn.onCodexRefresh?.(refreshed.original, refreshed.refreshed);
-    runtime.dispose();
-  };
+  const dispose = () => disposeTurnRuntime(runtime, turn.onCodexRefresh);
   const { scopeId, dir } = scopeDirectory(turn, scope);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   if (credential.provider === 'copilot') {
@@ -203,3 +202,32 @@ export async function harnessAdapterFor(
 
 /** Legacy permission-mode validation is still applied to project config. */
 export { parseClaudePermissionMode };
+
+/**
+ * Ends a turn runtime. A refreshed managed Codex credential is handed to the
+ * persistence callback, whose failure (sync or async) is logged as an
+ * application-authored line only; the private runtime home is always removed.
+ */
+export function disposeTurnRuntime(
+  runtime: Pick<TurnRuntime, 'refreshedCodexAuth' | 'dispose'>,
+  persist?: HarnessTurn['onCodexRefresh'],
+): Promise<void> {
+  const report = () =>
+    console.error(
+      '[opendots] codex turn warning: refreshed sign-in could not be saved; sign in again if the next turn fails',
+    );
+  let pending: Promise<unknown> | void = undefined;
+  try {
+    const refreshed = runtime.refreshedCodexAuth();
+    if (refreshed && persist)
+      pending = persist(refreshed.original, refreshed.refreshed);
+  } catch {
+    report();
+  } finally {
+    runtime.dispose();
+  }
+  return Promise.resolve(pending).then(
+    () => undefined,
+    () => report(),
+  );
+}

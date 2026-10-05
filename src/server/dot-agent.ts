@@ -485,7 +485,7 @@ export class DotAgent extends AbstractAgent {
                     createCopilotClient:
                       this.workspace.accounts.createCopilotClient,
                     onCodexRefresh: (original, refreshed) =>
-                      void this.workspace.accounts.persistCodexRefresh(
+                      this.workspace.accounts.persistCodexRefresh(
                         harnessAccount,
                         original,
                         refreshed,

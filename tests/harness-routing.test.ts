@@ -1568,3 +1568,38 @@ it.each([
     ).toBe(ok);
   },
 );
+
+it('always removes the turn runtime and never leaks a rejected Codex refresh save', async () => {
+  const { disposeTurnRuntime } =
+    await import('../src/server/model-adapters.js');
+  const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+  const unhandled = vi.fn();
+  process.on('unhandledRejection', unhandled);
+  try {
+    for (const persist of [
+      async () => {
+        throw new Error('EACCES /Users/me/secret-path token=abc');
+      },
+      () => {
+        throw new Error('sync failure token=abc');
+      },
+    ]) {
+      const dispose = vi.fn();
+      await disposeTurnRuntime(
+        {
+          refreshedCodexAuth: () => ({ original: 'a', refreshed: 'b' }),
+          dispose,
+        },
+        persist,
+      );
+      expect(dispose).toHaveBeenCalledTimes(1);
+    }
+    await new Promise((done) => setTimeout(done, 20));
+    expect(unhandled).not.toHaveBeenCalled();
+    expect(errors).toHaveBeenCalledTimes(2);
+    expect(JSON.stringify(errors.mock.calls)).not.toMatch(/secret-path|token=/);
+  } finally {
+    process.off('unhandledRejection', unhandled);
+    errors.mockRestore();
+  }
+});

@@ -10,13 +10,20 @@ import { join } from 'node:path';
 import type { HarnessProvider } from '../../shared/harness.js';
 import { HarnessTurnError } from './errors.js';
 import { profileVariable, scrubbedVariables } from './environment.js';
-import { snapshotCodexAuth } from './credentials.js';
+import { snapshotCodexAuth, type CopilotNativeState } from './credentials.js';
 
 /** The only credential a turn receives, injected by environment. */
 export type TurnCredential =
   | { provider: 'claude-code'; oauthToken: string }
-  /** Managed: explicit token. System default: Copilot's own logged-in user. */
-  | { provider: 'copilot'; githubToken: string | null }
+  /**
+   * Managed: explicit token. System default: the projected ordinary active
+   * user, resolved by Copilot itself from the native keyring.
+   */
+  | {
+      provider: 'copilot';
+      githubToken: string | null;
+      nativeState?: CopilotNativeState;
+    }
   /** `refreshable` is false for System default snapshots (no refresh token). */
   | { provider: 'codex'; authJson: string; refreshable: boolean };
 
@@ -84,12 +91,18 @@ export function prepareRuntime(
     const gh = join(home, 'gh');
     mkdirSync(gh, { mode: 0o700 });
     env.GH_CONFIG_DIR = gh;
-    // Documented Copilot setting: no user- or repo-level hooks.
+    // config.json holds managed state; user settings live in settings.json.
     writeFileSync(
-      join(home, 'config.json'),
-      JSON.stringify({ disableAllHooks: true }),
+      join(home, 'settings.json'),
+      JSON.stringify({ disableAllHooks: true, remoteExport: false }),
       { mode: 0o600 },
     );
+    if (credential.nativeState)
+      writeFileSync(
+        join(home, 'config.json'),
+        JSON.stringify(credential.nativeState),
+        { mode: 0o600 },
+      );
   } else {
     const authJson = credential.refreshable
       ? credential.authJson

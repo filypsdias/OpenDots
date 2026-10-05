@@ -139,6 +139,7 @@ export async function harnessAdapterFor(
         githubToken: credential.githubToken,
         createClient: turn.createCopilotClient,
         signal: scope.signal,
+        expectedUser: credential.nativeState?.lastLoggedInUser,
       }),
       middleware: [],
       dispose,

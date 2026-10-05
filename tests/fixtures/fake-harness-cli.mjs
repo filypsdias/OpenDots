@@ -147,6 +147,15 @@ const allowed = {
 if (provider === 'codex') {
   if (args[0] !== 'app-server') throw new Error('Codex must use app-server');
   record();
+  // Mirror the real parser: tokens.refresh_token is a required string field
+  // (`missing field refresh_token` otherwise); an empty string is accepted.
+  const auth = JSON.parse(
+    readFileSync(join(process.env.CODEX_HOME, 'auth.json'), 'utf8'),
+  );
+  if (typeof auth.tokens?.refresh_token !== 'string') {
+    console.error('missing field `refresh_token`');
+    process.exit(1);
+  }
   const send = (message) =>
     process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', ...message })}\n`);
   let thread;

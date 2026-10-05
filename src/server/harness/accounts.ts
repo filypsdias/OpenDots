@@ -45,6 +45,7 @@ type CopilotProbe = {
   getAuthStatus(): Promise<{
     isAuthenticated: boolean;
     authType?: string;
+    host?: string;
     login?: string;
   }>;
   listModels(): Promise<Array<{ id: string; name?: string }>>;
@@ -247,7 +248,11 @@ export class AccountManager {
     // Never read an intermediate value while a commit or rollback settles.
     await this.chains.get(snapshot.id)?.catch(() => undefined);
     if (snapshot.kind === 'system') {
-      if (provider === 'copilot') return { provider, githubToken: null };
+      if (provider === 'copilot') {
+        const nativeState = this.readers.copilotState?.() ?? null;
+        if (!nativeState) throw missingCredential(provider, 'missing');
+        return { provider, githubToken: null, nativeState };
+      }
       const found = await this.readers.read(provider);
       if (!found.ok) throw missingCredential(provider, found.reason);
       return provider === 'claude-code'
@@ -385,7 +390,10 @@ export class AccountManager {
    */
   private async withCopilot<T>(
     snapshot: AccountSnapshot,
-    fn: (client: CopilotProbe) => Promise<T>,
+    fn: (
+      client: CopilotProbe,
+      expected: { host: string; login: string } | undefined,
+    ) => Promise<T>,
   ): Promise<T> {
     const credential = await this.credential(snapshot);
     if (credential.provider !== 'copilot') throw new Error('Not Copilot.');
@@ -402,7 +410,7 @@ export class AccountManager {
       new CopilotClient(options)) as unknown as CopilotProbe;
     try {
       await client.start();
-      return await fn(client);
+      return await fn(client, credential.nativeState?.lastLoggedInUser);
     } finally {
       await client.stop().catch(() => undefined);
       runtime.dispose();
@@ -415,12 +423,17 @@ export class AccountManager {
     if (this.logins.has(id)) return this.store.account(id)!;
     if (snapshot.provider === 'copilot') {
       try {
-        const status = await this.withCopilot(snapshot, (client) =>
-          client.getAuthStatus(),
-        );
+        let expected: { host: string; login: string } | undefined;
+        const status = await this.withCopilot(snapshot, (client, user) => {
+          expected = user;
+          return client.getAuthStatus();
+        });
         // Only the account's own Copilot login counts: a GitHub CLI
         // fallback would be a different identity and quota.
-        const ready = copilotNativeLogin(status);
+        const ready =
+          snapshot.kind === 'system'
+            ? copilotNativeLogin(status, expected)
+            : status.isAuthenticated;
         this.store.setStatus(
           id,
           ready ? 'ready' : 'login_required',
@@ -575,6 +588,8 @@ export class AccountManager {
           await this.refresh(id).catch(() => undefined);
       }
     };
+    // `gh auth login --web` waits for Enter before opening the browser.
+    if (snapshot.provider === 'copilot') child.stdin?.write('\n');
     child.on('error', () => void finish(1));
     child.on('close', (code) => void finish(code));
     this.logins.set(id, entry);
@@ -654,14 +669,17 @@ export class AccountManager {
       refresh || !cached || Date.now() - cached.fetchedAt > 6 * 3600_000;
     if (provider === 'copilot' && snapshot && stale) {
       try {
-        const listed = await this.withCopilot(snapshot, async (client) => {
-          if (
-            snapshot.kind === 'system' &&
-            !copilotNativeLogin(await client.getAuthStatus())
-          )
-            throw new Error('Copilot login is not the account’s own login.');
-          return client.listModels();
-        });
+        const listed = await this.withCopilot(
+          snapshot,
+          async (client, user) => {
+            if (
+              snapshot.kind === 'system' &&
+              !copilotNativeLogin(await client.getAuthStatus(), user)
+            )
+              throw new Error('Copilot login is not the account’s own login.');
+            return client.listModels();
+          },
+        );
         discovered = listed.map((model) => ({
           id: model.id,
           label: model.name ?? model.id,

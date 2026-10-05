@@ -37,6 +37,7 @@ import {
 import {
   fileVault,
   parseClaudeKeychain,
+  parseCopilotState,
   parseCodexAuth,
   snapshotCodexAuth,
   type CredentialVault,
@@ -50,6 +51,7 @@ import {
 } from '../src/server/harness/errors.js';
 import {
   copilotErrorText,
+  copilotNativeLogin,
   copilotSessionConfig,
 } from '../src/server/harness/copilot-adapter.js';
 import {
@@ -357,7 +359,7 @@ describe('profile and environment isolation', () => {
     expect(
       JSON.parse(readFileSync(join(system.home, 'auth.json'), 'utf8')).tokens
         .refresh_token,
-    ).toBeUndefined();
+    ).toBe('');
     expect(system.refreshedCodexAuth()).toBeNull();
     system.dispose();
     expect(existsSync(system.home)).toBe(false);
@@ -398,7 +400,7 @@ describe('credentials', () => {
       snapshotCodexAuth(
         JSON.stringify({ tokens: { refresh_token: 'r', access_token: 'a' } }),
       ),
-    ).toBe('{"tokens":{"access_token":"a"}}');
+    ).toBe('{"tokens":{"refresh_token":"","access_token":"a"}}');
     expect(
       parseClaudeKeychain(
         JSON.stringify({
@@ -1302,6 +1304,13 @@ it('does not accept a GitHub CLI fallback as the Copilot System default identity
   };
   const accounts = new AccountManager(ws.harness, root, {
     vault: fileVault(root),
+    readers: {
+      read: async () => ({ ok: false, reason: 'missing' }),
+      copilotState: () => ({
+        lastLoggedInUser: { host: 'https://github.com', login: 'copilot-user' },
+        loggedInUsers: [{ host: 'https://github.com', login: 'copilot-user' }],
+      }),
+    },
     createCopilotClient: ((options: Record<string, unknown>) => {
       seen.push(options);
       return {
@@ -1484,3 +1493,78 @@ it('refuses a Copilot System default turn served by a GitHub CLI fallback before
     message: 'harness-error:auth',
   });
 });
+
+it('projects only the ordinary active Copilot identity from JSONC state, never tokens', () => {
+  const state = parseCopilotState(`// User settings belong in settings.json.
+// This file is managed automatically.
+{
+  "lastLoggedInUser": { "host": "https://github.com", "login": "bob" },
+  "loggedInUsers": [{ "host": "https://github.com", "login": "bob" }, { "host": "https://github.com", "login": "bob2" }],
+  "copilotTokens": { "https://github.com:bob": "t1", "https://github.com:bob2": "t2" },
+  "installedPlugins": [{ "name": "evil" }],
+  "trustedFolders": ["/"]
+}`);
+  expect(state).toEqual({
+    lastLoggedInUser: { host: 'https://github.com', login: 'bob' },
+    loggedInUsers: [{ host: 'https://github.com', login: 'bob' }],
+  });
+  expect(parseCopilotState('{"installedPlugins":[]}')).toBeNull();
+  expect(parseCopilotState('not json')).toBeNull();
+});
+
+it.each([
+  [
+    {
+      isAuthenticated: true,
+      authType: 'user',
+      login: 'bob',
+      host: 'https://github.com',
+    },
+    true,
+  ],
+  [
+    {
+      isAuthenticated: true,
+      authType: 'user',
+      login: 'bob',
+      host: 'github.com',
+    },
+    true,
+  ],
+  [
+    {
+      isAuthenticated: true,
+      authType: 'user',
+      login: 'bob2',
+      host: 'https://github.com',
+    },
+    false,
+  ],
+  [
+    {
+      isAuthenticated: true,
+      authType: 'user',
+      login: 'bob',
+      host: 'https://ghe.example.com',
+    },
+    false,
+  ],
+  [
+    {
+      isAuthenticated: true,
+      authType: 'gh-cli',
+      login: 'bob',
+      host: 'https://github.com',
+    },
+    false,
+  ],
+  [{ isAuthenticated: true, authType: 'env', login: 'bob' }, false],
+  [{ isAuthenticated: false, authType: 'user', login: 'bob' }, false],
+] as const)(
+  'accepts only the exact projected Copilot identity: %j → %s',
+  (status, ok) => {
+    expect(
+      copilotNativeLogin(status, { host: 'https://github.com', login: 'bob' }),
+    ).toBe(ok);
+  },
+);

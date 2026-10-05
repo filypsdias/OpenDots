@@ -202,6 +202,8 @@ export function parseClaudeKeychain(
 
 export interface SystemReaders {
   read(provider: HarnessProvider): Promise<SystemCredential>;
+  /** Ordinary Copilot active-user projection, or null when none exists. */
+  copilotState?(): CopilotNativeState | null;
 }
 
 /**
@@ -214,6 +216,16 @@ export function systemReaders(
   home = homedir(),
 ): SystemReaders {
   return {
+    copilotState() {
+      // The ordinary profile, never an inherited COPILOT_HOME override.
+      try {
+        return parseCopilotState(
+          readFileSync(join(home, '.copilot', 'config.json'), 'utf8'),
+        );
+      } catch {
+        return null;
+      }
+    },
     async read(provider) {
       if (provider === 'codex') {
         const path = join(home, '.codex', 'auth.json');
@@ -244,6 +256,43 @@ export function systemReaders(
  */
 export function snapshotCodexAuth(authJson: string): string {
   const value = JSON.parse(authJson) as { tokens?: Record<string, unknown> };
-  if (value.tokens) delete value.tokens.refresh_token;
+  // Codex requires the field (`missing field refresh_token` otherwise), so an
+  // inert empty value replaces it: any refresh attempt fails instead of
+  // rotating the ordinary login.
+  if (value.tokens) value.tokens.refresh_token = '';
   return JSON.stringify(value);
+}
+
+/**
+ * Auth-only projection of the ordinary Copilot CLI state. Copilot resolves
+ * its "user" login from `lastLoggedInUser`/`loggedInUsers` in
+ * `$COPILOT_HOME/config.json` and reads the token from the native keyring by
+ * (host, login). Only the active identity is copied; tokens, settings,
+ * plugins, hooks and MCP configuration never are.
+ */
+export interface CopilotNativeState {
+  lastLoggedInUser: { host: string; login: string };
+  loggedInUsers: Array<{ host: string; login: string }>;
+}
+
+export function parseCopilotState(text: string): CopilotNativeState | null {
+  try {
+    const value = JSON.parse(
+      text
+        .split('\n')
+        .filter((line) => !line.trim().startsWith('//'))
+        .join('\n'),
+    ) as Record<string, unknown>;
+    const user = value.lastLoggedInUser as
+      { host?: unknown; login?: unknown } | undefined;
+    if (typeof user?.host !== 'string' || typeof user.login !== 'string')
+      return null;
+    const active = { host: user.host, login: user.login };
+    // The plaintext `copilotTokens` key format is built in native code and
+    // is not source-proven, so it is never copied: only the keyring entry
+    // for exactly this (host, login) can authenticate.
+    return { lastLoggedInUser: active, loggedInUsers: [active] };
+  } catch {
+    return null;
+  }
 }

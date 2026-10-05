@@ -35,6 +35,8 @@ export interface CopilotTextConfig {
   createClient?: (options: CopilotClientOptions) => SdkClient;
   /** Outer turn cancellation (owner stop, pause, permission change). */
   signal?: AbortSignal;
+  /** System default: the projected ordinary active user that must answer. */
+  expectedUser?: { host: string; login: string };
 }
 
 export type SdkEvent = { type: string; data?: Record<string, unknown> };
@@ -460,9 +462,38 @@ export function combinedSignal(
   return present.length > 1 ? AbortSignal.any(present) : present[0];
 }
 
-/** True only for an authenticated Copilot login that is not a gh fallback. */
+/**
+ * True only for Copilot's own stored login (`authType: "user"`): never a
+ * GitHub CLI fallback, environment token or other identity.
+ */
 export function copilotNativeLogin(
-  status: { isAuthenticated: boolean; authType?: string } | undefined,
+  status:
+    | {
+        isAuthenticated: boolean;
+        authType?: string;
+        host?: string;
+        login?: string;
+      }
+    | undefined,
+  expected?: { host: string; login: string },
 ) {
-  return !!status?.isAuthenticated && status.authType !== 'gh-cli';
+  return (
+    !!status?.isAuthenticated &&
+    status.authType === 'user' &&
+    // The resolved identity must be exactly the projected active user.
+    (!expected ||
+      (status.login === expected.login &&
+        (!status.host || sameHost(status.host, expected.host))))
+  );
 }
+
+const sameHost = (a: string, b: string) => {
+  const name = (value: string) => {
+    try {
+      return new URL(value.includes('://') ? value : `https://${value}`).host;
+    } catch {
+      return value;
+    }
+  };
+  return name(a) === name(b);
+};

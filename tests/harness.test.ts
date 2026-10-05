@@ -8,7 +8,7 @@ import {
   chmod,
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { existsSync, readdirSync, realpathSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
 import { dirname, join, delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { EventType, type BaseEvent, type RunAgentInput } from '@ag-ui/core';
@@ -149,12 +149,23 @@ function fakeCopilot(record: Record<string, unknown>, mode: () => Mode) {
       },
       getAuthStatus: async () => ({
         isAuthenticated: true,
-        login: 'octo',
-        authType: 'token',
+        host: 'https://github.com',
+        login: (options as { gitHubToken?: string }).gitHubToken
+          ? 'octo'
+          : 'native-user',
+        // Explicit token for managed accounts; Copilot's own login otherwise.
+        authType: (options as { gitHubToken?: string }).gitHubToken
+          ? 'token'
+          : 'user',
       }),
       listModels: async () => [{ id: 'gpt-x', name: 'GPT X' }],
       createSession: async (config: Record<string, unknown>) => {
         record.config = config;
+        const home = (options as { baseDirectory: string }).baseDirectory;
+        for (const name of ['config.json', 'settings.json'])
+          record[name] = existsSync(join(home, name))
+            ? JSON.parse(readFileSync(join(home, name), 'utf8'))
+            : null;
         const handlers: Array<(event: SdkEvent) => void> = [];
         const emit = (type: string, data: Record<string, unknown> = {}) =>
           handlers.forEach((handler) => handler({ type, data }));
@@ -239,6 +250,7 @@ async function fixture(
     codexVersion?: string;
     codexRefresh?: string;
     systemCodexAuth?: string | null;
+    copilotState?: null;
   } = {},
 ) {
   const root = await mkdtemp(join(tmpdir(), 'opendots-harness-test-'));
@@ -309,6 +321,18 @@ async function fixture(
                 identity: null,
               }
             : { ok: false, reason: 'missing' },
+      copilotState: () =>
+        options.copilotState === null
+          ? null
+          : {
+              lastLoggedInUser: {
+                host: 'https://github.com',
+                login: 'native-user',
+              },
+              loggedInUsers: [
+                { host: 'https://github.com', login: 'native-user' },
+              ],
+            },
     },
     createCopilotClient: fakeCopilot(copilot, () => state.turn) as never,
   });
@@ -472,7 +496,21 @@ describe.each<HarnessProvider>(['claude-code', 'codex', 'copilot'])(
           else {
             expect(options).toMatchObject({ useLoggedInUser: true });
             expect(options).not.toHaveProperty('gitHubToken');
+            // Only the ordinary active-user identity was projected.
+            expect(f.copilot['config.json']).toEqual({
+              lastLoggedInUser: {
+                host: 'https://github.com',
+                login: 'native-user',
+              },
+              loggedInUsers: [
+                { host: 'https://github.com', login: 'native-user' },
+              ],
+            });
           }
+          expect(f.copilot['settings.json']).toEqual({
+            disableAllHooks: true,
+            remoteExport: false,
+          });
           return;
         }
         const rows = turnsOf(await f.readReceipts());
@@ -1240,3 +1278,12 @@ describe('cancellation and isolation regressions', () => {
     expect(options.connection.args).toContain('--no-remote-export');
   }, 15_000);
 });
+
+it('fails closed with Copilot login guidance when no ordinary Copilot user exists', async () => {
+  const f = await fixture('copilot', { account: 'system', copilotState: null });
+  const events = await f.run();
+  expect(errorsOf(events)[0]).toMatchObject({
+    message: expect.stringMatching(/copilot login/),
+  });
+  expect(f.copilot.options).toBeUndefined();
+}, 15_000);

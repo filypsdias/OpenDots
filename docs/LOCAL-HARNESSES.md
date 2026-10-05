@@ -46,6 +46,33 @@ returns stored results for identical completed actions, refuses actions whose
 outcome is unknown, and rechecks current permissions first. Turns interrupted
 by a server restart are marked failed with unknown tool outcomes.
 
+## Evidence for credential handling
+
+- **Copilot System default.** In the installed package
+  (`@github/copilot-darwin-arm64/app.js`), the auth manager's `"user"` login is
+  `{host, login}` from `authGetLastLoggedInUser(path)` over
+  `$COPILOT_HOME/config.json` (`_x`/`jK` resolve `config` under the home), and
+  its token comes from `tokenStoreGetToken(store, host, login, configPath, …)`
+  (`x9n.getToken`), a Rust keyring store in `prebuilds/darwin-arm64/runtime.node`
+  (`keyring` + `apple-native-keyring-store`). The native state keys
+  (`stateGlobalStateKeysJson`) are `lastLoggedInUser`, `loggedInUsers` and
+  `copilotTokens` (plaintext fallback). OpenDots copies only the active
+  `{host, login}` from the ordinary `~/.copilot/config.json` into the turn's
+  private home — never tokens, settings, plugins, hooks or MCP config — writes
+  `disableAllHooks`/`remoteExport: false` to its `settings.json`, empties
+  `GH_CONFIG_DIR`, and before any session requires `getAuthStatus()` to report
+  `authType: "user"` with exactly that login and host. Without an ordinary
+  Copilot login the turn stops with `copilot login` guidance.
+- **Claude.** The installed binary reads `claudeAiOauth.accessToken`,
+  `refreshToken` and `expiresAt` from the `Claude Code-credentials` item, and
+  documents `CLAUDE_CODE_OAUTH_TOKEN` (and `claude setup-token`) for
+  inference-only tokens.
+- **Codex.** A fake `auth.json` without `refresh_token` fails Codex's parser
+  (`missing field refresh_token`); with an empty value it is accepted. System
+  default snapshots therefore carry `refresh_token: ""`, so a refresh can never
+  rotate the ordinary login. Codex's default credential store is `file`
+  (`CODEX_HOME/auth.json`); keyring-only ordinary logins show sign-in guidance.
+
 ## Known limitations
 
 - No live inference or login ran during development. Native flag and SDK
@@ -55,6 +82,12 @@ by a server restart are marked failed with unknown tool outcomes.
 - `claude setup-token` and `gh auth login` run without a terminal UI; a code the
   browser shows can be pasted in Settings. The Claude Keychain JSON shape and the
   Codex `last_refresh` field are based on observed formats, not documentation.
-- Copilot's own stored login location is native and undocumented; OpenDots never
-  reads it directly. Copilot model discovery uses the SDK; Claude uses a catalog
-  plus custom IDs.
+- Copilot's keyring service naming lives in native code: the source shows the
+  lookup is keyed by `(host, login)` and receives the config path only for the
+  plaintext fallback, but whether the keyring entry itself depends on
+  `COPILOT_HOME` could not be proven without a live login. If it does, the System
+  default fails closed with guidance instead of using another identity. Logins
+  stored only in the plaintext `copilotTokens` map (keyring unavailable or
+  `storeTokenPlaintext`) are not projected, because that key format is built in
+  native code; they also fail closed.
+- Copilot model discovery uses the SDK; Claude uses a catalog plus custom IDs.

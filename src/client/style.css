@@ -4172,6 +4172,28 @@ h3 {
   display: grid;
   gap: 8px;
   background: var(--surface);
+  /* Never squeezed by, or drawn over, the transcript below it. */
+  flex-shrink: 0;
+  max-height: 50vh;
+  overflow-y: auto;
+}
+.route-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.route-summary .route-chip {
+  margin-left: 0;
+}
+.route-summary-text {
+  font-size: 12px;
+  color: var(--muted);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .route-chips {
   display: flex;

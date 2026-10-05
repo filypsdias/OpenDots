@@ -8,6 +8,8 @@ import {
   type SessionConfig,
   type CopilotClientOptions,
 } from '@github/copilot-sdk';
+import { accessSync, constants, statSync } from 'node:fs';
+import { delimiter, isAbsolute, join } from 'node:path';
 import { z } from 'zod';
 import { conversationPrompt } from './prompt.js';
 import { sanitizeChunk } from './errors.js';
@@ -53,13 +55,39 @@ export type SdkClient = {
   stop(): Promise<unknown>;
 };
 
+/**
+ * The SDK checks that its CLI path exists as a file and never searches PATH,
+ * so a bare command name is resolved here the way a shell would.
+ */
+export function resolveExecutable(
+  name: string,
+  path = process.env.PATH ?? '',
+): string {
+  if (isAbsolute(name) || name.includes('/')) return name;
+  for (const dir of path.split(delimiter)) {
+    if (!dir) continue;
+    const candidate = join(dir, name);
+    try {
+      if (!statSync(candidate).isFile()) continue;
+      accessSync(candidate, constants.X_OK);
+      return candidate;
+    } catch {
+      // Not here; keep searching.
+    }
+  }
+  return name;
+}
+
 /** Copilot SDK client options for one turn. */
 export function copilotClientOptions(
   config: CopilotTextConfig,
 ): CopilotClientOptions {
   return {
     connection: RuntimeConnection.forStdio({
-      path: config.executable ?? 'copilot',
+      path: resolveExecutable(
+        config.executable ?? 'copilot',
+        config.env.PATH ?? process.env.PATH,
+      ),
       // The SDK adds --headless/--no-auto-update; remote export is separate.
       args: ['--no-remote-export'],
     }),

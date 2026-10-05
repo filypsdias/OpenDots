@@ -101,8 +101,26 @@ export const defaultExec: Exec = (command, args, env, timeoutMs, cwd, signal) =>
     );
   });
 
+// Each login runs in its own process group so stopping it also stops the
+// helpers it started (cat, script, the CLI itself).
 const defaultLaunch: Launch = (command, args, env) =>
-  spawn(command, args, { env, stdio: ['pipe', 'pipe', 'pipe'] });
+  spawn(command, args, {
+    env,
+    stdio: ['pipe', 'pipe', 'pipe'],
+    detached: process.platform !== 'win32',
+  });
+
+/** Stops a login and everything it started. */
+function stopLogin(child: ChildProcess) {
+  if (child.pid && process.platform !== 'win32')
+    try {
+      process.kill(-child.pid, 'SIGTERM');
+      return;
+    } catch {
+      // Not a group leader (or already gone): stop the process itself.
+    }
+  child.kill();
+}
 
 /** Static examples; discovery and custom IDs extend these. */
 export const HARNESS_CATALOG: Record<HarnessProvider, HarnessModel[]> = {
@@ -143,14 +161,36 @@ export function parseCodexModels(stdout: string): HarnessModel[] {
   );
 }
 
+/**
+ * Plain text of terminal UI output: hyperlink (OSC) and cursor/colour (CSI)
+ * sequences are removed, so URLs and tokens are not split by escape codes.
+ */
+export function terminalText(output: string): string {
+  return (
+    output
+      // eslint-disable-next-line no-control-regex -- terminal escape codes
+      .replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g, '')
+      // eslint-disable-next-line no-control-regex -- terminal escape codes
+      .replace(/\u001b\[[0-9;?]*[A-Za-z]/g, ' ')
+  );
+}
+
 /** Extracts only a login URL and device code from native login output. */
 export function loginPrompt(output: string) {
-  const url = output.match(
-    /https:\/\/(?:github\.com\/login\/device|claude\.ai\/[^\s"'<>]*|console\.anthropic\.com\/[^\s"'<>]*|auth\.openai\.com\/[^\s"'<>]*)/,
+  const url = terminalText(output).match(
+    /https:\/\/(?:github\.com\/login\/device|(?:[\w-]+\.)?claude\.(?:ai|com)\/[^\s"'<>]*|console\.anthropic\.com\/[^\s"'<>]*|auth\.openai\.com\/[^\s"'<>]*)/,
   )?.[0];
   const code = output.match(/\b[A-Z0-9]{4}-[A-Z0-9]{4}\b/)?.[0];
   return url || code ? { url: url ?? null, code: code ?? null } : null;
 }
+
+/**
+ * Runs `claude setup-token` in a wide pseudo-terminal fed by a plain pipe.
+ * `cat` would otherwise wait on stdin forever after the login ends, so it is
+ * stopped then and the shell exits with the login's own status.
+ */
+export const CLAUDE_LOGIN_SCRIPT =
+  "cat | { script -q /dev/null sh -c 'stty cols 4000 rows 60 2>/dev/null; exec claude setup-token'; status=$?; pkill -P $$ -x cat; exit $status; }";
 
 /** Claude's long-lived subscription token printed by `claude setup-token`. */
 export const CLAUDE_SETUP_TOKEN = /sk-ant-oat01-[A-Za-z0-9_-]{20,}/;
@@ -463,10 +503,14 @@ export class AccountManager {
     const env = this.baseEnvironment();
     if (snapshot.provider === 'claude-code')
       // setup-token is interactive; `script` gives it a pseudo-terminal. Its
-      // throwaway config dir keeps the ordinary Claude profile untouched.
+      // throwaway config dir keeps the ordinary Claude profile untouched. A
+      // very wide terminal keeps the sign-in URL and the printed token on one
+      // line each (the UI otherwise wraps them at 80 columns). macOS `script`
+      // refuses a socket as stdin (Node's pipes), so `cat` relays it through
+      // an ordinary pipe; pasted codes still reach setup-token.
       return {
-        command: 'script',
-        args: ['-q', '/dev/null', 'claude', 'setup-token'],
+        command: 'sh',
+        args: ['-c', CLAUDE_LOGIN_SCRIPT],
         env: { ...env, CLAUDE_CONFIG_DIR: scratch! },
       };
     if (snapshot.provider === 'codex')
@@ -523,13 +567,13 @@ export class AccountManager {
     const capture = (chunk: Buffer) => {
       output = (output + chunk.toString()).slice(-8000);
       entry.prompt = loginPrompt(output) ?? entry.prompt;
-      token = output.match(CLAUDE_SETUP_TOKEN)?.[0] ?? token;
+      token = terminalText(output).match(CLAUDE_SETUP_TOKEN)?.[0] ?? token;
     };
     child.stdout?.on('data', capture);
     child.stderr?.on('data', capture);
     const timer = setTimeout(() => {
       entry.cancelled = true;
-      child.kill();
+      stopLogin(child);
     }, LOGIN_TIMEOUT_MS);
     timer.unref?.();
     let settled = false;
@@ -603,7 +647,9 @@ export class AccountManager {
     if (!entry) throw new Error('Account sign-in is not waiting for a code.');
     if (!/^[\w#.-]{4,512}$/.test(code))
       throw new Error('Account sign-in code has an unexpected format.');
-    entry.child.stdin?.write(`${code}\n`);
+    // Claude's terminal UI reads raw keys: Enter is a carriage return.
+    const enter = this.require(id).provider === 'claude-code' ? '\r' : '\n';
+    entry.child.stdin?.write(`${code}${enter}`);
   }
 
   loginPrompt(id: string) {
@@ -615,7 +661,7 @@ export class AccountManager {
     if (!entry) return;
     entry.cancelled = true;
     this.logins.delete(id);
-    entry.child.kill();
+    stopLogin(entry.child);
     if (entry.scratch) rmSync(entry.scratch, { recursive: true, force: true });
     if (this.store.account(id)) void this.refresh(id).catch(() => undefined);
   }

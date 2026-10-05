@@ -31,6 +31,7 @@ import {
 import {
   AccountManager,
   loginPrompt,
+  CLAUDE_LOGIN_SCRIPT,
   parseCodexModels,
   type Exec,
 } from '../src/server/harness/accounts.js';
@@ -494,8 +495,8 @@ describe('account manager', () => {
     const account = accounts.add('claude-code', 'Work');
     accounts.login(account.id);
     const [login] = launched;
-    expect(login.command).toBe('script');
-    expect(login.args).toEqual(['-q', '/dev/null', 'claude', 'setup-token']);
+    expect(login.command).toBe('sh');
+    expect(login.args).toEqual(['-c', CLAUDE_LOGIN_SCRIPT]);
     const scratch = login.env.CLAUDE_CONFIG_DIR!;
     expect(scratch).toMatch(/opendots-login-/);
     login.child.stdout.write(
@@ -506,6 +507,8 @@ describe('account manager', () => {
       code: null,
     });
     accounts.submitLoginCode(account.id, 'pasted-code#1');
+    // The terminal UI reads raw keys, so Enter is a carriage return.
+    expect(login.child.stdin.read()?.toString()).toBe('pasted-code#1\r');
     login.child.emit('close', 0);
     await vi.waitFor(() =>
       expect(ws.harness.account(account.id)?.status).toBe('ready'),
@@ -821,6 +824,14 @@ describe('error privacy', () => {
       code: '1A2B-3C4D',
     });
     expect(loginPrompt('nothing here')).toBeNull();
+    // Claude's terminal UI: OSC 8 hyperlink and colour codes around the URL.
+    const url =
+      'https://claude.com/cai/oauth/authorize?code=true&client_id=x&state=y';
+    expect(
+      loginPrompt(
+        `\u001b]8;id=a;${url}\u0007\u001b[38;2;153;153;153m${url}\u001b[39m\u001b]8;;\u0007\r\n`,
+      ),
+    ).toEqual({ url, code: null });
   });
 });
 
@@ -1602,4 +1613,95 @@ it('always removes the turn runtime and never leaks a rejected Codex refresh sav
     process.off('unhandledRejection', unhandled);
     errors.mockRestore();
   }
+});
+
+describe('claude login command', () => {
+  it.skipIf(process.platform !== 'darwin')(
+    'runs under Node pipes (macOS script rejects a socket stdin), relays the pasted code and exits with the login',
+    async () => {
+      const { spawn } = await import('node:child_process');
+      const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+      const { tmpdir } = await import('node:os');
+      const { join, delimiter } = await import('node:path');
+      const bin = mkdtempSync(join(tmpdir(), 'od-claude-'));
+      writeFileSync(
+        join(bin, 'claude'),
+        '#!/bin/sh\necho "Visit https://claude.com/cai/oauth/authorize?x=1"\nread code\necho "got:$code"\n',
+        { mode: 0o755 },
+      );
+      try {
+        const child = spawn('sh', ['-c', CLAUDE_LOGIN_SCRIPT], {
+          env: {
+            ...process.env,
+            PATH: `${bin}${delimiter}${process.env.PATH}`,
+          },
+          stdio: ['pipe', 'pipe', 'pipe'],
+        });
+        let output = '';
+        child.stdout.on('data', (chunk) => (output += chunk));
+        child.stderr.on('data', (chunk) => (output += chunk));
+        await vi.waitFor(() => expect(loginPrompt(output)?.url).toBeTruthy(), {
+          timeout: 5000,
+        });
+        const exited = new Promise<number | null>((resolve) =>
+          child.on('close', resolve),
+        );
+        child.stdin.write('abc-123\r');
+        await vi.waitFor(() => expect(output).toContain('got:abc-123'), {
+          timeout: 5000,
+        });
+        // The login ending must end the whole command (stdin stays open, as
+        // in the app), or its result is never collected.
+        expect(await exited).toBe(0);
+      } finally {
+        rmSync(bin, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(process.platform !== 'darwin')(
+    'stops every helper process when a sign-in is cancelled',
+    async () => {
+      const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+      const { execFileSync } = await import('node:child_process');
+      const { tmpdir } = await import('node:os');
+      const { join, delimiter } = await import('node:path');
+      const bin = mkdtempSync(join(tmpdir(), 'od-claude-'));
+      writeFileSync(
+        join(bin, 'claude'),
+        '#!/bin/sh\necho "Visit https://claude.com/cai/oauth/authorize?x=1"\nexec sleep 300\n',
+        { mode: 0o755 },
+      );
+      const ws = workspace();
+      const root = join(temp(), 'profiles');
+      vi.stubEnv('PATH', `${bin}${delimiter}${process.env.PATH}`);
+      const accounts = new AccountManager(ws.harness, root, {
+        vault: fileVault(root),
+        readers: { read: async () => ({ ok: false, reason: 'missing' }) },
+      });
+      const running = () => {
+        try {
+          return execFileSync('pgrep', ['-f', bin]).toString().trim();
+        } catch {
+          return '';
+        }
+      };
+      try {
+        const account = accounts.add('claude-code', 'Work');
+        accounts.login(account.id);
+        await vi.waitFor(() => expect(running()).not.toBe(''), {
+          timeout: 5000,
+        });
+        accounts.cancelLogin(account.id);
+        await vi.waitFor(() => expect(running()).toBe(''), { timeout: 5000 });
+        await vi.waitFor(() =>
+          expect(ws.harness.account(account.id)?.status).toBe('login_required'),
+        );
+      } finally {
+        vi.unstubAllEnvs();
+        if (running()) execFileSync('pkill', ['-f', bin]);
+        rmSync(bin, { recursive: true, force: true });
+      }
+    },
+  );
 });

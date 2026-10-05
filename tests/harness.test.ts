@@ -1287,3 +1287,25 @@ it('fails closed with Copilot login guidance when no ordinary Copilot user exist
   });
   expect(f.copilot.options).toBeUndefined();
 }, 15_000);
+
+describe('copilot executable resolution', () => {
+  it('resolves a bare name through PATH, since the SDK requires a file path', async () => {
+    const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+    const { resolveExecutable } =
+      await import('../src/server/harness/copilot-adapter.js');
+    const empty = mkdtempSync(join(tmpdir(), 'od-path-a-'));
+    const bin = mkdtempSync(join(tmpdir(), 'od-path-b-'));
+    writeFileSync(join(empty, 'copilot'), '', { mode: 0o644 });
+    writeFileSync(join(bin, 'copilot'), '#!/bin/sh\n', { mode: 0o755 });
+    try {
+      expect(resolveExecutable('copilot', [empty, bin].join(delimiter))).toBe(
+        join(bin, 'copilot'),
+      );
+      expect(resolveExecutable('copilot', empty)).toBe('copilot');
+      expect(resolveExecutable('/opt/copilot', bin)).toBe('/opt/copilot');
+    } finally {
+      rmSync(empty, { recursive: true, force: true });
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+});

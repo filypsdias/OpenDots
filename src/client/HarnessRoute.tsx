@@ -152,6 +152,8 @@ export function RouteBar({
   const [model, setModel] = useState('');
   const [error, setError] = useState('');
   const [working, setWorking] = useState(false);
+  // The route editor is collapsed to a one-line summary unless opened.
+  const [editing, setEditing] = useState(false);
   // Only the newest request for the current thread may update state, so a
   // slow older load can never overwrite a newer account or model.
   const latest = useRef(createLatest());
@@ -167,6 +169,7 @@ export function RouteBar({
     setModel('');
     setAccounts([]);
     setError('');
+    setEditing(false);
   }, [threadId]);
   const load = async () => {
     const token = latest.current.begin(threadId);
@@ -241,85 +244,106 @@ export function RouteBar({
     }
   };
   const recovery = route.recovery;
+  // A missing model or account needs attention, so the editor stays open.
+  const open = !!harness && (editing || route.modelRequired || !current);
   return (
     <section className="route-bar" aria-label="Model route">
-      <div className="route-chips">
+      <div className="route-summary">
         <span className="route-chip">
           {harness ? HARNESS_LABELS[harness] : 'Project model'}
         </span>
         {harness && (
-          <form
-            className="route-model"
-            onSubmit={(event) => {
-              event.preventDefault();
-              void act(() =>
-                api(`/conversations/${threadId}/model`, 'PUT', { model }),
-              );
-            }}
+          <span className="route-summary-text">
+            {route.model || 'No model'} · {current?.label ?? 'No account'}
+          </span>
+        )}
+        {harness && !route.modelRequired && current && (
+          <button
+            type="button"
+            className="link-button"
+            aria-expanded={editing}
+            onClick={() => setEditing((value) => !value)}
           >
-            <ModelPicker
-              provider={harness}
-              value={model}
-              required
-              label="Model for this conversation"
-              accountKey={route.activeAccount?.id ?? null}
-              onChange={setModel}
-            />
-            <button
-              className="primary"
-              disabled={
-                working ||
-                busy ||
-                !model.trim() ||
-                (model === route.model && !route.modelRequired)
-              }
-            >
-              Use model
-            </button>
-          </form>
-        )}
-        {harness && (
-          <label className="route-account">
-            <span className="field-label">
-              Active {HARNESS_LABELS[harness]} account (all conversations)
-            </span>
-            <select
-              value={current?.id ?? ''}
-              disabled={working}
-              onChange={(event) =>
-                void act(() =>
-                  api('/harness/active', 'POST', {
-                    provider: harness,
-                    accountId: event.target.value,
-                  }),
-                )
-              }
-            >
-              <option value="" disabled>
-                Choose an account
-              </option>
-              {accounts.map((account) => (
-                <option
-                  key={account.id}
-                  value={account.id}
-                  disabled={account.status === 'unsupported'}
-                >
-                  {account.label}
-                  {account.identity ? ` · ${account.identity}` : ''}
-                  {account.status === 'ready'
-                    ? ''
-                    : ` (${account.status.replace('_', ' ')})`}
-                </option>
-              ))}
-            </select>
-          </label>
-        )}
-        {harness && (
-          <button type="button" className="link-button" onClick={onManage}>
-            Manage accounts
+            {editing ? 'Done' : 'Change'}
           </button>
         )}
       </div>
+      {open && (
+        <div className="route-chips">
+          {harness && (
+            <form
+              className="route-model"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void act(() =>
+                  api(`/conversations/${threadId}/model`, 'PUT', { model }),
+                );
+              }}
+            >
+              <ModelPicker
+                provider={harness}
+                value={model}
+                required
+                label="Model for this conversation"
+                accountKey={route.activeAccount?.id ?? null}
+                onChange={setModel}
+              />
+              <button
+                className="primary"
+                disabled={
+                  working ||
+                  busy ||
+                  !model.trim() ||
+                  (model === route.model && !route.modelRequired)
+                }
+              >
+                Use model
+              </button>
+            </form>
+          )}
+          {harness && (
+            <label className="route-account">
+              <span className="field-label">
+                Active {HARNESS_LABELS[harness]} account (all conversations)
+              </span>
+              <select
+                value={current?.id ?? ''}
+                disabled={working}
+                onChange={(event) =>
+                  void act(() =>
+                    api('/harness/active', 'POST', {
+                      provider: harness,
+                      accountId: event.target.value,
+                    }),
+                  )
+                }
+              >
+                <option value="" disabled>
+                  Choose an account
+                </option>
+                {accounts.map((account) => (
+                  <option
+                    key={account.id}
+                    value={account.id}
+                    disabled={account.status === 'unsupported'}
+                  >
+                    {account.label}
+                    {account.identity ? ` · ${account.identity}` : ''}
+                    {account.status === 'ready'
+                      ? ''
+                      : ` (${account.status.replace('_', ' ')})`}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+          {harness && (
+            <button type="button" className="link-button" onClick={onManage}>
+              Manage accounts
+            </button>
+          )}
+        </div>
+      )}
       {earlier.length > 0 && (
         <p className="muted route-history">
           Earlier turns here were handled by: {earlier.join(', ')}.

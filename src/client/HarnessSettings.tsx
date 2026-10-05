@@ -299,13 +299,27 @@ export function HarnessSettings() {
                 const label = labels[provider]?.trim();
                 if (!label) return;
                 void act(`add-${provider}`, async () => {
-                  await api('/harness/accounts', 'POST', { provider, label });
+                  const account = await api<HarnessAccount>(
+                    '/harness/accounts',
+                    'POST',
+                    { provider, label },
+                  );
                   setLabels((all) => ({ ...all, [provider]: '' }));
+                  // Adding an account starts its sign-in right away.
+                  const started = await api<{ prompt: LoginPrompt }>(
+                    `/harness/accounts/${account.id}/login`,
+                    'POST',
+                    {},
+                  );
+                  setPrompts((all) => ({
+                    ...all,
+                    [account.id]: started.prompt,
+                  }));
                 });
               }}
             >
               <label className="field-label" htmlFor={`add-${provider}`}>
-                Add an OpenDots account
+                Add another account (opens its sign-in)
               </label>
               <input
                 id={`add-${provider}`}
@@ -323,7 +337,7 @@ export function HarnessSettings() {
                 className="primary"
                 disabled={!!working || !labels[provider]?.trim()}
               >
-                Add
+                Add and sign in
               </button>
             </form>
           </fieldset>

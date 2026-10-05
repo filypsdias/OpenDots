@@ -43,7 +43,7 @@ it('reports setup honestly without a standalone agent fallback', () => {
   expect(status.intelligence).toBe(false);
   expect(status.voice).toBe(false);
   expect(status.slack).toBe('not_configured');
-  expect(status.missing).toContain('INTELLIGENCE_API_KEY');
+  expect(status.missing).toContain('CPK_INTELLIGENCE_API_KEY');
 });
 it('rejects stop scope bypasses and misleading prefixes while allowing canonical owned routes', () => {
   const store = new WorkspaceStore(':memory:', 'owner');

@@ -44,6 +44,11 @@ export interface PlatformConfig extends WebConfig {
   slackTeam?: string;
   slackUsers: string[];
   slackDotId?: string;
+  jiraCloudId?: string;
+  jiraEmail?: string;
+  jiraApiToken?: string;
+  jiraSiteUrl?: string;
+  jiraDotId?: string;
   runtimeUrl: string;
   ownerToken?: string;
 }
@@ -64,7 +69,7 @@ export function setupStatus(
         : 'Model configuration is invalid.';
   }
   const missing = [
-    !config.intelligenceKey?.trim() && 'INTELLIGENCE_API_KEY',
+    !config.intelligenceKey?.trim() && 'CPK_INTELLIGENCE_API_KEY',
     modelError,
   ].filter((item): item is string => !!item);
   const declaredSlack = !!(

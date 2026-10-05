@@ -45,7 +45,7 @@ it('requires Intelligence and model setup and disables voice when either is abse
       voiceKey: 'fixture',
       voiceModel: 'fixture',
     }),
-  ).toMatchObject({ missing: ['INTELLIGENCE_API_KEY'], voice: false });
+  ).toMatchObject({ missing: ['CPK_INTELLIGENCE_API_KEY'], voice: false });
 });
 it('accepts each provider slot and harness host login without API keys', () => {
   const noKeys: PlatformConfig = {

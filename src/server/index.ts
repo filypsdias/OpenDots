@@ -33,9 +33,13 @@ const workspace = new WorkspaceStore(
   process.env.OWNER_ID || 'opendots-owner',
 );
 const config: PlatformConfig = {
-  intelligenceKey: process.env.INTELLIGENCE_API_KEY,
+  intelligenceKey:
+    process.env.CPK_INTELLIGENCE_API_KEY || process.env.INTELLIGENCE_API_KEY,
   intelligenceApiUrl: process.env.INTELLIGENCE_API_URL || undefined,
-  intelligenceWsUrl: process.env.INTELLIGENCE_WS_URL || undefined,
+  intelligenceWsUrl:
+    process.env.INTELLIGENCE_GATEWAY_WS_URL ||
+    process.env.INTELLIGENCE_WS_URL ||
+    undefined,
   apiKey: process.env.OPENAI_API_KEY,
   model: process.env.OPENAI_MODEL,
   baseUrl: process.env.OPENAI_BASE_URL ?? 'https://api.openai.com/v1',
@@ -71,6 +75,11 @@ const config: PlatformConfig = {
     .map((value) => value.trim())
     .filter(Boolean),
   slackDotId: process.env.SLACK_DOT_ID || undefined,
+  jiraCloudId: process.env.JIRA_CLOUD_ID || undefined,
+  jiraEmail: process.env.JIRA_EMAIL || undefined,
+  jiraApiToken: process.env.JIRA_API_TOKEN || undefined,
+  jiraSiteUrl: process.env.JIRA_SITE_URL || undefined,
+  jiraDotId: process.env.JIRA_DOT_ID || undefined,
   runtimeUrl: `http://${host === '::1' ? '[::1]' : '127.0.0.1'}:${port}/api/copilotkit`,
   ownerToken,
 };

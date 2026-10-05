@@ -8,7 +8,8 @@ import {
   chmod,
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join, delimiter, resolve } from 'node:path';
+import { realpathSync } from 'node:fs';
+import { dirname, join, delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { EventType, type RunAgentInput } from '@ag-ui/core';
 import { lastValueFrom, toArray } from 'rxjs';
@@ -57,7 +58,7 @@ afterEach(async () => {
   databases.splice(0).forEach((db) => db.close());
   vi.unstubAllEnvs();
   for (const root of roots.splice(0)) {
-    if (dirname(resolve(root)) !== resolve(tmpdir()))
+    if (dirname(realpathSync(root)) !== realpathSync(tmpdir()))
       throw new Error('Unexpected test temp directory');
     await rm(root, {
       recursive: true,
@@ -275,7 +276,9 @@ describe.each<Provider>(['claude-code', 'codex'])(
       expect(turns).toHaveLength(3);
       expect(new Set(turns.map((row) => row.cwd)).size).toBe(3);
       for (const row of turns) {
-        expect(dirname(row.cwd)).toBe(join(f.root, 'workspaces'));
+        expect(dirname(realpathSync(row.cwd))).toBe(
+          join(realpathSync(f.root), 'workspaces'),
+        );
         expect(row.cwd.slice(-64)).toMatch(/^[a-f0-9]{64}$/);
       }
     }, 20_000);
@@ -329,7 +332,9 @@ describe.each<Provider>(['claude-code', 'codex'])(
       expect(receipts.map((row) => row.phase)).toEqual(['auth', 'turn']);
       for (const row of receipts) {
         expect(row.present).toEqual([]);
-        expect(dirname(row.cwd)).toBe(join(f.root, 'workspaces'));
+        expect(dirname(realpathSync(row.cwd))).toBe(
+          join(realpathSync(f.root), 'workspaces'),
+        );
         expect(row.cwd.slice(-64)).toMatch(/^[a-f0-9]{64}$/);
         await vi.waitFor(() => expect(alive(row.pid)).toBe(false), {
           timeout: 4000,

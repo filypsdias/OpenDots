@@ -28,24 +28,39 @@ Open http://127.0.0.1:4310. Keep the server running for background work.
 
 Edit `.env` on the server and restart after changes:
 
-| Variable                                         | Purpose                                                   |
-| ------------------------------------------------ | --------------------------------------------------------- |
-| `INTELLIGENCE_API_KEY`                           | Project credential for conversation persistence           |
-| `INTELLIGENCE_API_URL`, `INTELLIGENCE_WS_URL`    | Endpoint overrides for your Intelligence deployment       |
-| `MODEL_PROVIDER`                                 | openai, anthropic, cline-pass, claude-code, codex, custom |
-| `OPENAI_API_KEY`, `OPENAI_MODEL`                 | Model credential and model identifier                     |
-| `OPENAI_BASE_URL`                                | Compatible model API endpoint                             |
-| `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`           | Anthropic API credential and model identifier             |
-| `ANTHROPIC_BASE_URL`                             | Anthropic-compatible endpoint, including `/v1`            |
-| `CLINE_API_KEY`, `CLINE_MODEL`, `CLINE_BASE_URL` | Cline API credential, model, and endpoint                 |
-| `CLAUDE_MODEL`, `CLAUDE_AUTH_MODE`               | Claude subscription CLI (`claude auth login`, local only) |
-| `CODEX_MODEL`, `CODEX_AUTH_MODE`                 | ChatGPT subscription harness (`codex login`, local only)  |
-| `CLAUDE_CWD`, `CODEX_CWD`                        | Optional local working directory for the selected CLI     |
-| `CLAUDE_PERMISSION_MODE`                         | Claude CLI permission mode, default `acceptEdits`         |
-| `OWNER_ID`                                       | Stable identity used for this deployment's conversations  |
-| `DATABASE_PATH`                                  | SQLite file containing pages, workspace and work metadata |
-| `OWNER_TOKEN`                                    | Application access token required for external bindings   |
-| `APP_ORIGIN`                                     | Exact browser origin when using a proxy or custom domain  |
+| Variable                                                         | Purpose                                                                    |
+| ---------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| `INTELLIGENCE_API_KEY`                                           | Project credential for conversation persistence                            |
+| `INTELLIGENCE_API_URL`, `INTELLIGENCE_WS_URL`                    | Endpoint overrides for your Intelligence deployment                        |
+| `MODEL_PROVIDER`                                                 | openai, anthropic, cline-pass, claude-code, codex, custom                  |
+| `OPENAI_API_KEY`, `OPENAI_MODEL`                                 | Model credential and model identifier                                      |
+| `OPENAI_BASE_URL`                                                | Compatible model API endpoint                                              |
+| `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`                           | Anthropic API credential and model identifier                              |
+| `ANTHROPIC_BASE_URL`                                             | Anthropic-compatible endpoint, including `/v1`                             |
+| `CLINE_API_KEY`, `CLINE_MODEL`, `CLINE_BASE_URL`                 | Cline API credential, model, and endpoint                                  |
+| `CLAUDE_MODEL`, `CLAUDE_AUTH_MODE`                               | Claude subscription CLI (`claude auth login`, local only)                  |
+| `CODEX_MODEL`, `CODEX_AUTH_MODE`                                 | ChatGPT subscription harness (`codex login`, local only)                   |
+| `CLAUDE_CWD`, `CODEX_CWD`                                        | Optional local working directory for the selected CLI                      |
+| `CLAUDE_PERMISSION_MODE`                                         | Claude CLI permission mode, default `acceptEdits`                          |
+| `OWNER_ID`                                                       | Stable identity used for this deployment's conversations                   |
+| `DATABASE_PATH`                                                  | SQLite file containing pages, workspace and work metadata                  |
+| `OWNER_TOKEN`                                                    | Application access token required for external bindings                    |
+| `APP_ORIGIN`                                                     | Exact browser origin when using a proxy or custom domain                   |
+| `JIRA_SITE_URL`, `JIRA_CLOUD_ID`, `JIRA_EMAIL`, `JIRA_API_TOKEN` | Read-only Jira access for the configured Dot                               |
+| `JIRA_DOT_ID`                                                    | Dot allowed to query Jira                                                  |
+| `JIRA_SITE_URL`, `JIRA_CLOUD_ID`, `JIRA_EMAIL`, `JIRA_API_TOKEN` | Read-only Jira access for the configured Dot                               |
+| `JIRA_DOT_ID`                                                    | Dot allowed to query Jira                                                  |
+| Variable                                                         | Purpose                                                                    |
+| --------------------------------                                 | -------------------------------------------------------------------------- |
+| `CPK_INTELLIGENCE_API_KEY`                                       | CopilotKit project key; legacy `INTELLIGENCE_API_KEY` is accepted if unset |
+| `INTELLIGENCE_API_URL`                                           | API endpoint override for your Intelligence deployment                     |
+| `INTELLIGENCE_GATEWAY_WS_URL`                                    | Gateway websocket URL; legacy `INTELLIGENCE_WS_URL` is accepted if unset   |
+| `OPENAI_API_KEY`, `OPENAI_MODEL`                                 | Model credential and model identifier                                      |
+| `OPENAI_BASE_URL`                                                | Compatible model API endpoint                                              |
+| `OWNER_ID`                                                       | Stable identity used for this deployment's conversations                   |
+| `DATABASE_PATH`                                                  | SQLite file containing pages, workspace and work metadata                  |
+| `OWNER_TOKEN`                                                    | Application access token; required for external bindings                   |
+| `APP_ORIGIN`                                                     | Exact browser origin when using a proxy or custom domain                   |
 
 Provider credentials belong in the server's `.env`. Leave unused service keys empty. The selected model slot needs its own credential and model before chat can run. Conversation history lives in the configured Intelligence project. Copying SQLite alone does not back up that history.
 
@@ -110,6 +125,24 @@ Use the same secret on the app and browser processes. Browser navigation is read
 ## Persistent Dot computers
 
 For a separate browser, persistent files, and optional shell for each specialist, follow [Computer setup](COMPUTERS.md). This uses pinned OpenBot computer/supervisor services and per-Dot permissions. Parallel research tools remain available alongside configured computer tools. With the browser provider selected, Dots use their computer tools in place of the read-only public-page tool. Enable each Dot's required capabilities before use.
+
+## Read-only Jira issue search
+
+OpenDots can expose a fixed Jira search to one configured Dot. It only lists up to 50 unresolved issues assigned to the authenticated Jira account; it cannot create or update issues. The scoped token and account email stay on the server. Jira issue text is untrusted input to the Dot.
+
+For Jira Cloud, create an Atlassian API token with scopes and grant `read:jira-work`. Atlassian recommends scoped tokens; scoped Jira tokens use the API gateway and your site's Cloud ID. See [Atlassian's token guide](https://support.atlassian.com/atlassian-account/docs/manage-api-tokens-for-your-atlassian-account) and [Jira issue-search API](https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-search/).
+
+Get the Cloud ID by opening `https://<your-site>.atlassian.net/_edge/tenant_info` and copying `cloudId` from its JSON response. Set these server-side variables in `.env`:
+
+```dotenv
+JIRA_SITE_URL=https://eci-solutions.atlassian.net
+JIRA_CLOUD_ID=YOUR_CLOUD_ID
+JIRA_EMAIL=your-atlassian-account-email
+JIRA_API_TOKEN=YOUR_SCOPED_API_TOKEN
+JIRA_DOT_ID=YOUR_DOT_ID
+```
+
+Use the ID of the intended Dot, available from the `/api/workspace` response. Jira tools are exposed only when `JIRA_DOT_ID` matches that Dot. Restart OpenDots after setting the values. The Dot's `list_my_jira_issues` tool runs a fixed JQL query using `currentUser()` and does not accept arbitrary JQL. No ticket data is requested until you ask the Dot to check Jira.
 
 ## Slack
 
@@ -177,6 +210,8 @@ For remote hosting, configure an HTTPS reverse proxy and the matching `APP_ORIGI
 ## Automatic learning
 
 OpenDots connects [CopilotKit Automatic Learning](https://docs.copilotkit.ai/learning)
+to individual Dots. It uses the existing server-side `INTELLIGENCE_API_KEY` and
+optional `INTELLIGENCE_API_URL`. No additional model key or frontend key is needed.
 to individual Dots. It uses the existing server-side `INTELLIGENCE_API_KEY` and
 optional `INTELLIGENCE_API_URL`. No additional model key or frontend key is needed.
 

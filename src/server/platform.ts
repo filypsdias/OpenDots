@@ -151,7 +151,7 @@ export class Platform {
   async handle(request: Request): Promise<Response> {
     if (!this.handler)
       return Response.json(
-        { error: 'Setup required: INTELLIGENCE_API_KEY.' },
+        { error: 'Setup required: CPK_INTELLIGENCE_API_KEY.' },
         { status: 503 },
       );
     let body: unknown;

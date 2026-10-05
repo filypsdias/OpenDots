@@ -19,3 +19,4 @@ data/
 
 # Local hosted-project selection
 .copilotkit/
+.copilotkit/local.json
